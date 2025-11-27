@@ -1,0 +1,13 @@
+langchain-core==0.3.42
+langchain==0.3.20
+langchain-community==0.3.19
+langchain-huggingface==0.1.2
+langchain-qdrant==0.2.1
+qdrant-client==1.10.1          # ← 关键：必须 >=1.10.1
+sentence-transformers==3.0.1
+torch==2.3.1
+transformers==4.41.0
+unstructured==0.15.0
+tqdm
+python-dotenv
+accelerate
