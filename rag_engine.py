@@ -15,9 +15,14 @@ from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+# from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import torch
-
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    Phi3ForCausalLM,   # ← 显式导入
+    pipeline
+)
 # 配置日志器（模块级）
 logger = logging.getLogger(__name__)
 # 全局日志配置（仅在首次导入时生效）
@@ -163,7 +168,7 @@ class MedicalRAG:
             logger.error(f"LLM加载失败: {e}", exc_info=True)
             logger.warning("→ 使用超轻量级模型: microsoft/Phi-3-mini-4k-instruct (需要在线下载)")
             try:
-                from transformers import Phi3ForCausalLM, AutoTokenizer
+                # from transformers import Phi3ForCausalLM
                 model = Phi3ForCausalLM.from_pretrained(
                     "microsoft/Phi-3-mini-4k-instruct",
                     device_map="auto",
