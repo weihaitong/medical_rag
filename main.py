@@ -2,6 +2,9 @@
 import logging
 import os
 
+if os.path.exists("./qdrant_db/qdrant.lock"):
+    os.remove("./qdrant_db/qdrant.lock")
+
 def setup_logging(log_file="logs/medical_rag.log", level=logging.INFO):
     """统一日志配置：同时输出到控制台和文件"""
     os.makedirs(os.path.dirname(log_file), exist_ok=True)

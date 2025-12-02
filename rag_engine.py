@@ -16,6 +16,8 @@ from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 # from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
 import torch
 from transformers import (
     AutoTokenizer,
@@ -33,6 +35,7 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)  # 可根据需要调整为 logging.DEBUG
 
+logger.propagate = False#防止打印两遍日志
 # 禁用部分 noisy 日志（可选）
 logging.getLogger("langchain").setLevel(logging.ERROR)
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
@@ -41,6 +44,7 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 class MedicalRAG:
     def __init__(self, data_path: str = "data/", collection_name: str = "medical_db"):
         self.data_path = data_path
+        self.qdrant_path = "./qdrant_db"
         self._auto_convert_pdfs()
         self.collection_name = collection_name
         self._init_models()
@@ -189,42 +193,107 @@ class MedicalRAG:
                 logger.critical("无法加载任何语言模型。请检查网络连接或创建 models/ 目录并放置本地模型。")
                 raise
 
+    # def _load_and_index_documents(self):
+    #     logger.info("加载医学文档...")
+    #     documents = []
+    #     for file in os.listdir(self.data_path):
+    #         if file.endswith(".txt"):
+    #             loader = TextLoader(os.path.join(self.data_path, file), encoding="utf-8")
+    #             docs = loader.load()
+    #             for doc in docs:
+    #                 doc.metadata["source"] = file
+    #             documents.extend(docs)
+    #
+    #     if not documents:
+    #         raise ValueError("未找到任何医学文档！请检查 data/ 目录。")
+    #
+    #     text_splitter = RecursiveCharacterTextSplitter(
+    #         chunk_size=400,
+    #         chunk_overlap=50,
+    #         separators=["\n\n", "\n", "。", "；", " "]
+    #     )
+    #     chunks = text_splitter.split_documents(documents)
+    #
+    #     logger.info(f"共生成 {len(chunks)} 个文本块，正在构建向量库...")
+    #     self.vector_store = Qdrant.from_documents(
+    #         chunks,
+    #         self.embedding_model,
+    #         path="./qdrant_db",
+    #         collection_name=self.collection_name,
+    #         force_recreate=False
+    #     )
+    #
+    #     base_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
+    #     compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
+    #     self.retriever = ContextualCompressionRetriever(
+    #         base_compressor=compressor,
+    #         base_retriever=base_retriever
+    #     )
     def _load_and_index_documents(self):
+        # 假设 self.collection_name = "medical_db"
+        import inspect
+        print("Qdrant class location:", inspect.getfile(Qdrant))
+        print("Qdrant module:", Qdrant.__module__)
+        # 1. 检查数据文件
         logger.info("加载医学文档...")
         documents = []
-        for file in os.listdir(self.data_path):
-            if file.endswith(".txt"):
-                loader = TextLoader(os.path.join(self.data_path, file), encoding="utf-8")
-                docs = loader.load()
-                for doc in docs:
-                    doc.metadata["source"] = file
-                documents.extend(docs)
+        try:
+            for file in os.listdir(self.data_path):
+                # 检查是否为文件，避免尝试加载目录
+                full_path = os.path.join(self.data_path, file)
+                if file.endswith(".txt") and os.path.isfile(full_path):
+                    logger.debug(f"加载文件: {file}")
+                    # 使用 TextLoader，指定编码
+                    loader = TextLoader(full_path, encoding="utf-8")
+                    docs = loader.load()
+                    for doc in docs:
+                        doc.metadata["source"] = file
+                    documents.extend(docs)
+                else:
+                    logger.debug(f"跳过非 .txt 文件或目录: {file}")
+        except FileNotFoundError:
+            logger.error(f"数据路径不存在: {self.data_path}")
+            raise ValueError(f"数据路径不存在: {self.data_path}")
+        except Exception as e:
+            logger.error(f"加载文档时发生错误: {e}")
+            raise
 
         if not documents:
-            raise ValueError("未找到任何医学文档！请检查 data/ 目录。")
+            raise ValueError("未找到任何医学文档！请检查 data/ 目录并确保存在 .txt 文件。")
 
+        # 2. 分块
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=400,
             chunk_overlap=50,
             separators=["\n\n", "\n", "。", "；", " "]
         )
         chunks = text_splitter.split_documents(documents)
+        logger.info(f"成功加载 {len(documents)} 个文档，共生成 {len(chunks)} 个文本块，正在构建向量库...")
 
-        logger.info(f"共生成 {len(chunks)} 个文本块，正在构建向量库...")
-        self.vector_store = Qdrant.from_documents(
-            chunks,
-            self.embedding_model,
-            path="./qdrant_db",
-            collection_name=self.collection_name,
-            force_recreate=True
-        )
+        # 3. 构建/写入 Qdrant 向量库
+        try:
+            self.vector_store = Qdrant.from_documents(
+                chunks,
+                self.embedding_model,
+                path="./qdrant_db",
+                collection_name=self.collection_name,
+                # 保持 force_recreate=True 以确保每次都是全新的索引
+                # 如果写入失败，请检查文件系统权限
+                force_recreate=False
+            )
+            logger.info("Qdrant 向量库构建完成。")
+        except Exception as e:
+            logger.error(f"Qdrant 写入失败，请检查 `./qdrant_db` 目录权限或磁盘空间。错误: {e}")
+            raise
 
+        # 4. 配置检索器
         base_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
         compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
         self.retriever = ContextualCompressionRetriever(
             base_compressor=compressor,
             base_retriever=base_retriever
         )
+        logger.info("检索器配置完成。")
 
     def _rewrite_query(self, query: str) -> str:
         rewrite_rules = {
