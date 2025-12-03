@@ -193,42 +193,6 @@ class MedicalRAG:
                 logger.critical("无法加载任何语言模型。请检查网络连接或创建 models/ 目录并放置本地模型。")
                 raise
 
-    # def _load_and_index_documents(self):
-    #     logger.info("加载医学文档...")
-    #     documents = []
-    #     for file in os.listdir(self.data_path):
-    #         if file.endswith(".txt"):
-    #             loader = TextLoader(os.path.join(self.data_path, file), encoding="utf-8")
-    #             docs = loader.load()
-    #             for doc in docs:
-    #                 doc.metadata["source"] = file
-    #             documents.extend(docs)
-    #
-    #     if not documents:
-    #         raise ValueError("未找到任何医学文档！请检查 data/ 目录。")
-    #
-    #     text_splitter = RecursiveCharacterTextSplitter(
-    #         chunk_size=400,
-    #         chunk_overlap=50,
-    #         separators=["\n\n", "\n", "。", "；", " "]
-    #     )
-    #     chunks = text_splitter.split_documents(documents)
-    #
-    #     logger.info(f"共生成 {len(chunks)} 个文本块，正在构建向量库...")
-    #     self.vector_store = Qdrant.from_documents(
-    #         chunks,
-    #         self.embedding_model,
-    #         path="./qdrant_db",
-    #         collection_name=self.collection_name,
-    #         force_recreate=False
-    #     )
-    #
-    #     base_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
-    #     compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
-    #     self.retriever = ContextualCompressionRetriever(
-    #         base_compressor=compressor,
-    #         base_retriever=base_retriever
-    #     )
     def _load_and_index_documents(self):
         # 假设 self.collection_name = "medical_db"
         import inspect
@@ -318,17 +282,36 @@ class MedicalRAG:
 
         prompt_template = """
 你是一名专业医疗助手，请严格依据以下医学资料回答问题。
-如果资料中无相关信息，请回答："根据当前知识库无法回答该问题"。
+你的唯一信息来源是检索到的医学资料（Context）。请严格遵循以下规则回答。
 
 【医学资料】
 {context}
 
-【问题】
+【用户问题】
 {question}
 
-【要求】
-1. 回答必须准确、简洁；
-2. 禁止任何猜测、编造或超出资料范围的建议。
+【回答规则】
+1. **只允许使用 Context 中出现的信息回答**；不得依据常识、不得凭经验补充、不得引用外部知识。
+2. 若 Context 未包含答案，必须回复：  
+   “根据当前知识库无法回答该问题。”
+3. 你的回答必须：
+   - 语言专业、准确、客观  
+   - 内容简洁、结构清晰  
+   - 不包含推测、杜撰、过度概括或专业建议外延
+4. 不提供诊断、治疗方案、用药推荐、风险评估等医疗决策性内容。
+5. 不输出任何可能被理解为医疗建议的语句，可以描述事实，但不能推论。
+6. 回答格式：
+   - 先给出“直接答案”（若能回答）  
+   - 若相关知识在 Context 多处出现，可列出简要来源摘要（非 URL）
+
+【输出格式】
+请严格使用以下结构：
+
+【回答】
+（你的主要回答）
+
+【依据】
+（简要列出来自 Context 的依据，不生成新内容）
 """
         prompt = ChatPromptTemplate.from_template(prompt_template)
 
