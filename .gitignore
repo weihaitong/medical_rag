@@ -323,4 +323,5 @@ pyrightconfig.json
 
 #data
 data/
-
+models/
+qdrant_db/

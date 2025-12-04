@@ -26,6 +26,23 @@ from transformers import (
     Phi3ForCausalLM,   # ← 显式导入
     pipeline
 )
+
+def get_torch_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"   # Apple Silicon
+    else:
+        return "cpu"
+
+def get_dtype():
+    if torch.cuda.is_available():
+        return torch.float16
+    elif torch.backends.mps.is_available():
+        return torch.float16   # MPS 支持 float16
+    else:
+        return torch.float32   # CPU 回退 float32
+
 # 配置日志器（模块级）
 logger = logging.getLogger(__name__)
 # 全局日志配置（仅在首次导入时生效）
@@ -106,13 +123,13 @@ class MedicalRAG:
                 logger.info(f"→ 使用本地模型: {model_path}")
                 self.embedding_model = HuggingFaceEmbeddings(
                     model_name=model_path,
-                    model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+                    model_kwargs={"device": get_torch_device()},
                     encode_kwargs={"normalize_embeddings": True}
                 )
             else:
                 self.embedding_model = HuggingFaceEmbeddings(
                     model_name="BAAI/bge-m3",
-                    model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+                    model_kwargs={"device": get_torch_device()},
                     encode_kwargs={"normalize_embeddings": True}
                 )
         except Exception as e:
@@ -120,7 +137,7 @@ class MedicalRAG:
             logger.warning("→ 使用轻量级备用模型: sentence-transformers/all-MiniLM-L6-v2")
             self.embedding_model = HuggingFaceEmbeddings(
                 model_name="sentence-transformers/all-MiniLM-L6-v2",
-                model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"}
+                model_kwargs={"device": get_torch_device()},
             )
 
         logger.info("加载重排器 (BAAI/bge-reranker-v2-m3)...")
@@ -143,7 +160,7 @@ class MedicalRAG:
                 logger.info(f"→ 使用本地LLM: {llm_path}")
                 model = AutoModelForCausalLM.from_pretrained(
                     llm_path,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    torch_dtype=get_dtype(),
                     device_map="auto",
                     trust_remote_code=True
                 )
@@ -154,7 +171,7 @@ class MedicalRAG:
                 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
                 model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    torch_dtype=get_dtype(),
                     device_map="auto",
                     trust_remote_code=True
                 )
