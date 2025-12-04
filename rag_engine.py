@@ -66,6 +66,7 @@ class MedicalRAG:
         self._auto_convert_pdfs()
         self.collection_name = collection_name
         self._init_models()
+        self._init_rewrite_llm()
         try:
             self._load_and_index_documents()
         except Exception as e:
@@ -211,6 +212,27 @@ class MedicalRAG:
                 logger.critical("无法加载任何语言模型。请检查网络连接或创建 models/ 目录并放置本地模型。")
                 raise
 
+    def _init_rewrite_llm(self):
+        """只用于 Query Rewrite 的轻量模型"""
+        model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=get_dtype(),
+            device_map="auto",
+            trust_remote_code=True
+        )
+
+        pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=80,
+            temperature=0.0,  # 确保不乱改
+            do_sample=False
+        )
+        self.rewrite_llm = HuggingFacePipeline(pipeline=pipe)
+
     def _load_and_index_documents(self):
         # 假设 self.collection_name = "medical_db"
         import inspect
@@ -333,22 +355,56 @@ class MedicalRAG:
 """
         prompt = ChatPromptTemplate.from_template(prompt_template)
         # ------ Query Rewrite ------
+        # query_rewrite_prompt = ChatPromptTemplate.from_messages([
+        #     SystemMessagePromptTemplate.from_template(
+        #         "你是医学查询规范化助手，任务是将用户的医学问题转换成标准、简洁、可用于检索的医学问句。\n"
+        #         "必须严格遵守以下规则：\n"
+        #         "1. 不改变原始语义，不新增、不删除医学含义。\n"
+        #         "2. 不增加任何解释、定义、背景知识。\n"
+        #         "3. 不生成多句，只输出一个单句。\n"
+        #         "4. 不扩写内容，不医学推断，不智能联想。\n"
+        #         "5. 若输入已规范，原样输出。\n"
+        #         "6. 只做最小改写，例如术语规范化、去除废词、补全问句。\n"
+        #         "7. 输出禁止带引号、前缀、后缀、markdown、JSON。\n"
+        #     ),
+        #     # Few-shot examples
+        #     HumanMessagePromptTemplate.from_template("头痛怎么办？"),
+        #     AIMessagePromptTemplate.from_template("头痛的治疗方法是什么？"),
+        #
+        #     HumanMessagePromptTemplate.from_template("我肚子疼，是不是胃炎？"),
+        #     AIMessagePromptTemplate.from_template("腹痛是否由胃炎引起？"),
+        #
+        #     HumanMessagePromptTemplate.from_template("高血压吃啥药好？"),
+        #     AIMessagePromptTemplate.from_template("高血压的推荐药物有哪些？"),
+        #
+        #     HumanMessagePromptTemplate.from_template("{query}")
+        # ])
+
         query_rewrite_prompt = ChatPromptTemplate.from_messages([
-            SystemMessagePromptTemplate.from_template(
-                "你是一个医学查询规范化引擎。你的任务是将用户输入的医学问题改写为标准、简洁、规范的医学问句。"
-                "你必须遵守以下规则：\n"
-                "1. 仅输出改写后的问题，不要任何解释、前缀、后缀、标点引导（如“改写后：”、“答案：”等）。\n"
-                "2. 不要回答问题，不要添加知识，不要生成 JSON 或 Markdown。\n"
-                "3. 如果输入已是规范表达，直接原样输出，不做任何修改。\n"
-                "4. 输出必须是单行文本，以问号结尾（如原问题有问号）或保持陈述句（如原问题无问号）。\n"
-                "5. **绝对不要开启多轮对话，不要复述指令，不要自我确认。**"
-            ),
-            HumanMessagePromptTemplate.from_template("{query}")
+            ("system",
+             "你是一个医学查询规范化助手。请将用户的医学问题改写成一个标准、简洁、可用于检索的单句问句。\n"
+             "要求：\n"
+             "- 仅输出改写后的问句，且必须是完整的一句话。\n"
+             "- 禁止输出任何解释、问候、追问、建议或额外文字。\n"
+             "- 禁止输出 Markdown、引号、序号、前缀（如 'AI:'、'答：' 等）。\n"
+             "- 改写后立即停止生成，不要继续说话。\n"
+             "- 示例中的 AI 回答就是你输出的唯一格式。\n"
+             "- 如果输入已是规范表达，直接原样输出，不做任何修改。\n"
+             "- 输出必须是单行文本，以问号结尾（如原问题有问号）或保持陈述句（如原问题无问号）。\n"
+             "- 绝对不要开启多轮对话，不要复述指令，不要自我确认。\n"
+             ),
+            ("human", "头痛怎么办？"),
+            ("ai", "头痛的治疗方法是什么？"),
+            ("human", "我肚子疼，是不是胃炎？"),
+            ("ai", "腹痛是否由胃炎引起？"),
+            ("human", "高血压吃啥口药好？"),
+            ("ai", "高血压的推荐药物有哪些？"),
+            ("human", "{query}")
         ])
 
         query_rewriter_chain = (
                 query_rewrite_prompt
-                | self.llm
+                | self.rewrite_llm
                 | StrOutputParser()
         )
 
