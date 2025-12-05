@@ -1,7 +1,6 @@
 # rag_engine.py
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # 修正：移除末尾多余空格！
-
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import logging
 from typing import List, Optional
 from langchain_community.document_loaders import TextLoader
@@ -15,7 +14,6 @@ from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-# from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
@@ -23,9 +21,32 @@ import torch
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    Phi3ForCausalLM,   # ← 显式导入
+    Phi3ForCausalLM,
     pipeline
 )
+# 配置日志器（模块级）
+logger = logging.getLogger(__name__)
+logger.info(f"HF_ENDPOINT set to: {os.environ.get('HF_ENDPOINT')}")
+# 全局日志配置（仅在首次导入时生效）
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)  # 可根据需要调整为 logging.DEBUG
+
+logger.propagate = False#防止打印两遍日志
+# 禁用部分 noisy 日志（可选）
+logging.getLogger("langchain").setLevel(logging.ERROR)
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
+#导入图库
+try:
+    from graph_retriever import GraphRetriever
+    GRAPH_RETRIEVER_AVAILABLE = True
+except ImportError:
+    GRAPH_RETRIEVER_AVAILABLE = False
+    logger.warning("未找到 graph_retriever.py，图检索功能将被禁用。")
 
 def get_torch_device():
     if torch.cuda.is_available():
@@ -43,22 +64,6 @@ def get_dtype():
     else:
         return torch.float32   # CPU 回退 float32
 
-# 配置日志器（模块级）
-logger = logging.getLogger(__name__)
-# 全局日志配置（仅在首次导入时生效）
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)  # 可根据需要调整为 logging.DEBUG
-
-logger.propagate = False#防止打印两遍日志
-# 禁用部分 noisy 日志（可选）
-logging.getLogger("langchain").setLevel(logging.ERROR)
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-
-
 class MedicalRAG:
     def __init__(self, data_path: str = "data/", collection_name: str = "medical_db"):
         self.data_path = data_path
@@ -67,6 +72,9 @@ class MedicalRAG:
         self.collection_name = collection_name
         self._init_models()
         self._init_rewrite_llm()
+        # ===== 初始化图检索器（新增一行）=====
+        self.graph_retriever = GraphRetriever() if GRAPH_RETRIEVER_AVAILABLE else None
+
         try:
             self._load_and_index_documents()
         except Exception as e:
@@ -191,7 +199,6 @@ class MedicalRAG:
             logger.error(f"LLM加载失败: {e}", exc_info=True)
             logger.warning("→ 使用超轻量级模型: microsoft/Phi-3-mini-4k-instruct (需要在线下载)")
             try:
-                # from transformers import Phi3ForCausalLM
                 model = Phi3ForCausalLM.from_pretrained(
                     "microsoft/Phi-3-mini-4k-instruct",
                     device_map="auto",
@@ -213,25 +220,28 @@ class MedicalRAG:
                 raise
 
     def _init_rewrite_llm(self):
-        """只用于 Query Rewrite 的轻量模型"""
-        model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=get_dtype(),
-            device_map="auto",
-            trust_remote_code=True
-        )
-
-        pipe = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=80,
-            temperature=0.0,  # 确保不乱改
-            do_sample=False
-        )
-        self.rewrite_llm = HuggingFacePipeline(pipeline=pipe)
+        try:
+            """只用于 Query Rewrite 的轻量模型"""
+            model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=get_dtype(),
+                device_map="auto",
+                trust_remote_code=True
+            )
+            pipe = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=tokenizer,
+                max_new_tokens=80,
+                temperature=0.0,  # 确保不乱改
+                do_sample=False
+            )
+            self.rewrite_llm = HuggingFacePipeline(pipeline=pipe)
+        except Exception as e:
+            logger.warning(f"Query rewrite LLM 加载失败，复用主 LLM。错误: {e}")
+            self.rewrite_llm = self.llm  # fallback
 
     def _load_and_index_documents(self):
         # 假设 self.collection_name = "medical_db"
@@ -291,13 +301,43 @@ class MedicalRAG:
             raise
 
         # 4. 配置检索器
-        base_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
+        # base_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
+        # compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
+        # self.retriever = ContextualCompressionRetriever(
+        #     base_compressor=compressor,
+        #     base_retriever=base_retriever
+        # )
+        # logger.info("向量检索器配置完成。")
+
+    def _hybrid_retrieve(self, query: str) -> List:
+        """混合检索：向量 + 图 → 合并 → 统一 rerank"""
+        # 1. 向量检索（原始相似性）
+        vector_docs = self.vector_store.similarity_search(query, k=5)
+
+        # 2. 图检索（如有）
+        graph_docs = []
+        if self.graph_retriever:
+            try:
+                graph_docs = self.graph_retriever.retrieve(query)
+            except Exception as e:
+                logger.error(f"图检索异常（已跳过）: {e}")
+
+        # 3. 合并 & 去重
+        all_docs = vector_docs + graph_docs
+        seen = set()
+        unique_docs = []
+        for doc in all_docs:
+            key = doc.page_content.strip()
+            if key and key not in seen:
+                seen.add(key)
+                unique_docs.append(doc)
+
+        if not unique_docs:
+            return []
+        # 4. 统一 rerank（使用你原有的 reranker）
         compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
-        self.retriever = ContextualCompressionRetriever(
-            base_compressor=compressor,
-            base_retriever=base_retriever
-        )
-        logger.info("检索器配置完成。")
+        reranked_docs = compressor.compress_documents(documents=unique_docs, query=query)
+        return reranked_docs
 
     def _rewrite_query(self, query: str) -> str:
         rewrite_rules = {
@@ -354,32 +394,6 @@ class MedicalRAG:
 （简要列出来自 Context 的依据，不生成新内容）
 """
         prompt = ChatPromptTemplate.from_template(prompt_template)
-        # ------ Query Rewrite ------
-        # query_rewrite_prompt = ChatPromptTemplate.from_messages([
-        #     SystemMessagePromptTemplate.from_template(
-        #         "你是医学查询规范化助手，任务是将用户的医学问题转换成标准、简洁、可用于检索的医学问句。\n"
-        #         "必须严格遵守以下规则：\n"
-        #         "1. 不改变原始语义，不新增、不删除医学含义。\n"
-        #         "2. 不增加任何解释、定义、背景知识。\n"
-        #         "3. 不生成多句，只输出一个单句。\n"
-        #         "4. 不扩写内容，不医学推断，不智能联想。\n"
-        #         "5. 若输入已规范，原样输出。\n"
-        #         "6. 只做最小改写，例如术语规范化、去除废词、补全问句。\n"
-        #         "7. 输出禁止带引号、前缀、后缀、markdown、JSON。\n"
-        #     ),
-        #     # Few-shot examples
-        #     HumanMessagePromptTemplate.from_template("头痛怎么办？"),
-        #     AIMessagePromptTemplate.from_template("头痛的治疗方法是什么？"),
-        #
-        #     HumanMessagePromptTemplate.from_template("我肚子疼，是不是胃炎？"),
-        #     AIMessagePromptTemplate.from_template("腹痛是否由胃炎引起？"),
-        #
-        #     HumanMessagePromptTemplate.from_template("高血压吃啥药好？"),
-        #     AIMessagePromptTemplate.from_template("高血压的推荐药物有哪些？"),
-        #
-        #     HumanMessagePromptTemplate.from_template("{query}")
-        # ])
-
         query_rewrite_prompt = ChatPromptTemplate.from_messages([
             ("system",
              "你是一个医学查询规范化助手。请将用户的医学问题改写成一个标准、简洁、可用于检索的单句问句。\n"
@@ -410,15 +424,21 @@ class MedicalRAG:
 
         def log_and_rewrite(question_str):
             logger.debug(f"原始查询: {question_str}")
-            rewritten = query_rewriter_chain.invoke({"query": question_str})
-            logger.info(f"查询重写-----Query Rewrite: {question_str} → {rewritten}")
-            return {"rewritten_q": rewritten, "original_q": question_str}
+            # 1. 先用规则重写
+            rule_rewritten = self._rewrite_query(question_str)
+            # 2. 再用 LLM 规范化
+            final_rewritten = query_rewriter_chain.invoke({"query": rule_rewritten})
+            logger.info(f"查询重写流程: 原始 → 规则 → LLM")
+            logger.info(f"  原始问题: {question_str}")
+            logger.info(f"  规则重写: {rule_rewritten}")
+            logger.info(f"  LLM重写: {final_rewritten}")
+            return {"rewritten_q": final_rewritten, "original_q": question_str}
 
         input_mapper = RunnableLambda(log_and_rewrite)
 
         def retrieve_and_log(x):
-            docs = self.retriever.invoke(x["rewritten_q"])
-            logger.debug("\n重排后返回的文本块（Top 3）:")
+            docs = self._hybrid_retrieve(x["rewritten_q"])  # 混合检索点
+            logger.debug("\n混合检索后返回的文本块（Top 3）:")
             for i, doc in enumerate(docs, 1):
                 content = doc.page_content.strip()[:200].replace('\n', ' ')
                 source = doc.metadata.get("source", "未知")
