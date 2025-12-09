@@ -1,0 +1,15 @@
+mysql:
+  host: "192.168.10.138"
+  port: 3306
+  user: "root"
+  password: "123456"
+  database: "lyyl"
+
+neo4j:
+  uri: "neo4j://192.168.10.138:7687"
+  user: "neo4j"
+  password: "Neo4j9527"
+
+embedding:
+  model_url: "http://localhost:8000/embeddings"   # 你自己的 embedding 模型服务
+  dim: 768
