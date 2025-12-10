@@ -7,7 +7,7 @@
         Hallucination Rate（幻觉率）
         Medical Risk Score（医疗风险）
 
-    次重要指标⭐
+    次重要指标
         Coverage（知识覆盖率）
         Precision （精准率）
         Groundedness （依据程度）
