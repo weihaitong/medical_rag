@@ -220,8 +220,13 @@ class MedicalRAG:
                 raise
 
     def _init_rewrite_llm(self):
-        try:
-            """只用于 Query Rewrite 的轻量模型"""
+        """
+        Query Rewrite LLM（SGLang 版）：
+        - 优先使用 SGLang OpenAI-compatible HTTP 接口
+        - 失败 / 超时 / 异常时自动降级为本地 HuggingFacePipeline
+        """
+        # ========= 1. 本地 fallback（必须成功） =========
+        def load_local_rewrite_llm():
             model_name = "Qwen/Qwen2.5-0.5B-Instruct"
             tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             model = AutoModelForCausalLM.from_pretrained(
@@ -235,13 +240,48 @@ class MedicalRAG:
                 model=model,
                 tokenizer=tokenizer,
                 max_new_tokens=80,
-                temperature=0.0,  # 确保不乱改
+                temperature=0.0,
                 do_sample=False
             )
-            self.rewrite_llm = HuggingFacePipeline(pipeline=pipe)
+            return HuggingFacePipeline(pipeline=pipe)
+
+        try:
+            local_llm = load_local_rewrite_llm()
+            logger.info("Rewrite LLM 本地 fallback 加载成功")
+        except Exception:
+            logger.exception("Rewrite 本地模型加载失败，直接复用主 LLM")
+            self.rewrite_llm = self.llm
+            return
+
+        # ========= 2. SGLang 远程 LLM =========
+        try:
+            from remote_rewrite_llm import RemoteRewriteLLM
+
+            sglang_llm = RemoteRewriteLLM(
+                endpoint="http://127.0.0.1:8000/v1/chat/completions",
+                # SGLang 中 model 名称必须与 launch_server 时一致
+                model="Qwen/Qwen2.5-0.5B-Instruct",
+                timeout=2.0,
+                api_key=None
+            )
+
+            # ========= 3. 远程 + 本地安全降级 =========
+            class RewriteWithFallback(Runnable):
+                def invoke(self, input: str, **kwargs) -> str:
+                    try:
+                        result = sglang_llm.invoke(input)
+                        # 防御：确保返回单行字符串
+                        return result.strip().splitlines()[0]
+                    except Exception as e:
+                        logger.info(f"Rewrite LLM 降级为本地模型，原因: {e}")
+                        return local_llm.invoke(input)
+
+            self.rewrite_llm = RewriteWithFallback()
+            logger.info("Rewrite LLM 使用：SGLang 远程优先 + 本地 fallback")
+
         except Exception as e:
-            logger.warning(f"Query rewrite LLM 加载失败，复用主 LLM。错误: {e}")
-            self.rewrite_llm = self.llm  # fallback
+            logger.warning(f"SGLang Rewrite LLM 初始化失败，使用本地模型: {e}")
+            self.rewrite_llm = local_llm
 
     def _load_and_index_documents(self):
         # 假设 self.collection_name = "medical_db"
