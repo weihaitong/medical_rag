@@ -18,6 +18,10 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 import torch
+import time
+from langchain_core.runnables import Runnable
+from langchain_core.messages import BaseMessage
+from langchain_core.prompt_values import ChatPromptValue
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -221,10 +225,11 @@ class MedicalRAG:
 
     def _init_rewrite_llm(self):
         """
-        Query Rewrite LLM（SGLang 版）：
-        - 优先使用 SGLang OpenAI-compatible HTTP 接口
+        Query Rewrite LLM：
+        - 优先使用 FastAPI OpenAI-compatible Server
         - 失败 / 超时 / 异常时自动降级为本地 HuggingFacePipeline
         """
+
         # ========= 1. 本地 fallback（必须成功） =========
         def load_local_rewrite_llm():
             model_name = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -240,7 +245,7 @@ class MedicalRAG:
                 model=model,
                 tokenizer=tokenizer,
                 max_new_tokens=80,
-                temperature=0.0,
+                #temperature=0.0,
                 do_sample=False
             )
             return HuggingFacePipeline(pipeline=pipe)
@@ -253,36 +258,42 @@ class MedicalRAG:
             self.rewrite_llm = self.llm
             return
 
-        # ========= 2. SGLang 远程 LLM =========
+        # ========= 2. FastAPI 远程 Rewrite LLM =========
         try:
-            from remote_rewrite_llm import RemoteRewriteLLM
+            from fastapi_rewrite_llm import FastAPIRewriteLLM
 
-            sglang_llm = RemoteRewriteLLM(
+            remote_llm = FastAPIRewriteLLM(
                 endpoint="http://127.0.0.1:8000/v1/chat/completions",
-                # SGLang 中 model 名称必须与 launch_server 时一致
                 model="Qwen/Qwen2.5-0.5B-Instruct",
-                timeout=2.0,
-                api_key=None
+                timeout=2.0
             )
 
-            # ========= 3. 远程 + 本地安全降级 =========
-            #SGLang（经过验证了），vLLM在本地不可使用，缺少cuda，不能在macos上使用。
-            #转而自己的使用自己的极简 FastAPI Server
+            # ========= 3. 远程优先 + 本地降级 =========
             class RewriteWithFallback(Runnable):
-                def invoke(self, input: str, **kwargs) -> str:
+                def invoke(self, input, config=None, **kwargs) -> str:
+                    # === 关键：兼容 ChatPromptValue ===
+                    if isinstance(input, ChatPromptValue):
+                        # 取最后一条 HumanMessage
+                        messages = input.to_messages()
+                        human_msgs = [m for m in messages if m.type == "human"]
+                        query = human_msgs[-1].content if human_msgs else messages[-1].content
+                    else:
+                        query = str(input)
+
                     try:
-                        result = sglang_llm.invoke(input)
-                        # 防御：确保返回单行字符串
+                        start = time.time()
+                        result = remote_llm.invoke(query)
+                        logger.info(f"Rewrite remote latency={time.time() - start:.2f}s")
                         return result.strip().splitlines()[0]
                     except Exception as e:
                         logger.info(f"Rewrite LLM 降级为本地模型，原因: {e}")
-                        return local_llm.invoke(input)
+                        return local_llm.invoke(query)
 
             self.rewrite_llm = RewriteWithFallback()
-            logger.info("Rewrite LLM 使用：SGLang 远程优先 + 本地 fallback")
+            logger.info("Rewrite LLM 使用策略：FastAPI 远程优先 + 本地 fallback")
 
         except Exception as e:
-            logger.warning(f"SGLang Rewrite LLM 初始化失败，使用本地模型: {e}")
+            logger.warning(f"FastAPI Rewrite LLM 初始化失败，使用本地模型: {e}")
             self.rewrite_llm = local_llm
 
     def _load_and_index_documents(self):

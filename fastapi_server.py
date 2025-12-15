@@ -3,8 +3,17 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 import torch
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+# app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    pipe("你好")  # 模型预热
+    yield
+    # shutdown（可选）
+
+app = FastAPI(lifespan=lifespan)
 
 def get_torch_device():
     if torch.cuda.is_available():
@@ -46,3 +55,8 @@ def chat(req: ChatReq):
             {"message": {"role": "assistant", "content": out}}
         ]
     }
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
