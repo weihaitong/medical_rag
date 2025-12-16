@@ -31,17 +31,9 @@ from transformers import (
 # 配置日志器（模块级）
 logger = logging.getLogger(__name__)
 logger.info(f"HF_ENDPOINT set to: {os.environ.get('HF_ENDPOINT')}")
-# 全局日志配置（仅在首次导入时生效）
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)  # 可根据需要调整为 logging.DEBUG
-
-# logger.propagate = False#防止打印两遍日志
+logger.setLevel(logging.DEBUG)
 # 禁用部分 noisy 日志（可选）
-logging.getLogger("langchain").setLevel(logging.ERROR)
+# logging.getLogger("langchain").setLevel(logging.ERROR)
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 
 #导入图库
@@ -395,15 +387,6 @@ class MedicalRAG:
         except Exception as e:
             logger.error(f"Qdrant 写入失败，请检查 `./qdrant_db` 目录权限或磁盘空间。错误: {e}")
             raise
-
-        # 4. 配置检索器
-        # base_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
-        # compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
-        # self.retriever = ContextualCompressionRetriever(
-        #     base_compressor=compressor,
-        #     base_retriever=base_retriever
-        # )
-        # logger.info("向量检索器配置完成。")
 
     def _hybrid_retrieve(self, query: str) -> List:
         """混合检索：向量 + 图 → 合并 → 统一 rerank"""

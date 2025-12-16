@@ -131,8 +131,10 @@ def chat(req: ChatReq):
     outputs = pipe(prompt)
     generated_text = outputs[0]["generated_text"]
 
+    logger.info("LLM outputs 原始结构: %s", outputs)
     # 只返回 assistant 新生成的部分（可按需裁剪）
     answer = generated_text[len(prompt):].strip()
+    logger.info("实际返回给客户端的 answer: \n%s", answer)
 
     return {
         "choices": [
