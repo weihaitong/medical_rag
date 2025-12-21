@@ -33,7 +33,7 @@ class GraphRetriever:
             logger.info("Neo4j 依赖缺失，图检索器未启用。")
             return
 
-        uri = os.getenv("NEO4J_URI", "bolt://192.168.10.138:7687")
+        uri = os.getenv("NEO4J_URI", "bolt://192.168.43.225:7687")
         user = os.getenv("NEO4J_USER", "neo4j")
         password = os.getenv("NEO4J_PASSWORD", "Neo4j9527")
 

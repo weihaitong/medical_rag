@@ -5,7 +5,7 @@ import sys
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ServiceUnavailable  # ← 关键修改
 
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://192.168.10.138:7687")
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://192.168.43.225:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "Neo4j9527")
 

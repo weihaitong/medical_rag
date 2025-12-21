@@ -705,9 +705,12 @@ class MedicalRAG:
         if extracted:
             try:
                 return json.loads(extracted)
-            except Exception:
-                logger.warning("提取 JSON 后仍解析失败")
-
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"提取 JSON 后解析失败: {e.msg} at line {e.lineno}, col {e.colno}. 原始内容片段: {extracted[:200]!r}")
+            except Exception as e:
+                logger.warning(
+                    f"提取 JSON 后发生未知解析错误: {type(e).__name__}: {e}. 原始内容片段: {extracted[:200]!r}")
         # 让 LLM 修复 JSON
         repaired = self._repair_json_with_llm(text, medical_text)
         try:
@@ -733,6 +736,150 @@ class MedicalRAG:
             "tests": [],
             "review_conclusion": "病历信息不足，无法完成结构化检阅。"
         }
+
+    def _execute_batch_audit(self, queries: List[str], case_context: dict) -> List[dict]:
+        """
+        执行批量审核：遍历原子查询 -> 混合检索 -> 验证逻辑
+        """
+        results = []
+
+        for query in queries:
+            try:
+                # 1. 复用混合检索 (Hybrid Retrieve)
+                # 注意：这里我们使用 RAG 类已有的 _hybrid_retrieve 方法
+                docs = self._hybrid_retrieve(query)
+
+                if not docs:
+                    continue
+
+                # 2. 构造审核 Prompt
+                # 将检索到的证据 (Context) 和 原始病例 (Case) 结合
+                context_text = "\n".join([d.page_content[:300] for d in docs])
+                sources = list(set([d.metadata.get("source", "未知") for d in docs]))
+
+                audit_prompt = f"""
+                你是一名药品安全审核员。请依据【检索到的医学证据】对【当前查询】进行风险评估。
+
+                【当前查询点】: {query}
+
+                【医学证据 (Evidence)】:
+                {context_text}
+
+                【审核任务】:
+                基于证据判断当前用药是否存在风险（如超量、配伍禁忌、证候不符）。
+
+                【输出格式】:
+                风险等级: (高/中/低/无)
+                审核结论: (简短描述，如“用法用量符合说明书”或“存在配伍禁忌风险”)
+                引用来源: {sources}
+                """
+
+                # 3. 调用 LLM 进行判断 (使用 rewrite_llm 这种小参数模型做快速判断即可，或者用 ollama)
+                # 这里为了准确性建议用 ollama generate
+                review_res = self.ollama.generate([
+                    {"role": "system", "content": "你是一个严谨的药学审核助手。请简练回答。"},
+                    {"role": "user", "content": audit_prompt}
+                ])
+
+                results.append({
+                    "query": query,
+                    "evidence_sources": sources,
+                    "ai_review": review_res
+                })
+
+            except Exception as e:
+                logger.error(f"审核查询 '{query}' 时发生错误: {e}")
+
+        return results
+
+    def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
+        """
+        核心方法：使用本地模型进行查询重写与拆解。
+        将复杂的病例 JSON 上下文拆解为独立的、可检索的原子问题。
+        """
+        # 1. 准备上下文
+        patient = case_json.get("patient_info", {}) or {}  # 防止 patient_info 本身是 None
+        diagnosis_info = case_json.get("diagnosis_info", {}) or {}
+        clinical_diagnosis = diagnosis_info.get("clinical_diagnosis", []) or []
+        # 修复：安全获取 meds，如果 treatment_plan 为 None 则默认为空列表
+        treatment_plan = case_json.get("treatment_plan") or {}
+        meds = treatment_plan.get("medications") or []
+
+        # 修复：更加健壮的处方字符串构建逻辑
+        # 1. 过滤掉 name 为 None 的无效数据
+        # 2. 确保 name 和 usage 都是字符串类型
+        valid_meds_str_list = []
+        for m in meds:
+            # 使用 (var or '') 技巧：如果是 None 则变为空字符串
+            name = m.get('name')
+            usage = m.get('usage')
+
+            # 只有当药名存在时才拼接，否则跳过
+            if name:
+                med_str = f"{name} {usage or ''}".strip()
+                valid_meds_str_list.append(med_str)
+
+        # 如果列表为空（比如解析全是 None），给一个默认值，防止 LLM 理解歧义
+        meds_context = ", ".join(valid_meds_str_list) if valid_meds_str_list else "无明确处方记录"
+
+        # 构造简化的 Prompt 上下文
+        context_str = (
+            f"患者: {patient.get('age', '未知')}, {patient.get('gender', '未知')}\n"
+            f"诊断: {', '.join(clinical_diagnosis)}\n"
+            f"处方: {meds_context}"
+        )
+
+        decomposition_prompt = f"""
+        你是一个临床药学审核系统的查询生成引擎。
+        请将以下病例拆解为多个独立的、用于检索医学知识库的【原子查询语句】。
+
+        【病例信息】
+        {context_str}
+
+        【生成规则】
+        1. 针对每种药物，生成关于【用法用量】和【禁忌症】的查询。
+        2. 如果患者有特殊状态（老人、儿童、孕妇、肝肾功能不全），生成针对该状态的【特殊人群用药】查询。
+        3. 如果处方中有多种药物，生成两两之间的【相互作用】查询。
+        4. 生成针对诊断的【适应症】匹配查询。
+
+        【输出要求】
+        - 仅输出一个 JSON 列表格式的字符串。
+        - 列表元素为字符串（Query）。
+        - 不要输出任何其他解释。
+
+        【示例输出】
+        ["阿莫西林胶囊的成人标准用法用量", "阿莫西林与痛风的禁忌症", "阿莫西林是否适用于急性扁桃体炎"]
+        """
+
+        try:
+            # 复用 self.ollama (7B模型) 以获得更好的指令遵循能力
+            # 如果想用更快的速度，可以切换为 self.rewrite_llm (0.5B)，但复杂拆解可能准确率较低
+            logger.info("模型生成原子查询 %s", decomposition_prompt)
+            response = self._invoke_llm(decomposition_prompt)
+
+            # 清洗结果，提取 JSON 列表
+            match = re.search(r"\[[\s\S]*\]", response)
+            if match:
+                queries = json.loads(match.group(0))
+                return [str(q) for q in queries if isinstance(q, str)]
+            else:
+                logger.warning("查询拆解未能解析出 JSON 列表，使用后备规则。")
+                return self._fallback_decomposition(meds)
+
+        except Exception as e:
+            logger.error(f"查询拆解失败: {e}")
+            return self._fallback_decomposition(meds)
+
+    def _fallback_decomposition(self, meds: List[dict]) -> List[str]:
+        """降级策略：基于规则的简单拆解"""
+        queries = []
+        for m in meds:
+            name = m.get('name')
+            if name:
+                queries.append(f"{name} 说明书 用法用量")
+                queries.append(f"{name} 禁忌症")
+                queries.append(f"{name} 药物相互作用")
+        return queries
 
     def _safe_llm_call(self, prompt: str, retry: int = 2) -> str:
         last_error = None
@@ -763,10 +910,31 @@ class MedicalRAG:
         raw_output = self._safe_llm_call(prompt)
 
         # JSON 解析 + 自动修复
-        parsed = self._parse_or_repair_json(raw_output, medical_text)
+        extracted_data = self._parse_or_repair_json(raw_output, medical_text)
 
-        logger.info("病历检阅完成（JSON 已结构化）%s", parsed)
-        return parsed
+        logger.info("病历检阅完成（JSON 已结构化）%s", extracted_data)
+        # 如果抽取失败或为空，直接返回
+        if not extracted_data.get("treatment_plan", {}).get("medications"):
+            logger.warning("未检测到处方信息，跳过用药审核步骤。")
+            extracted_data["audit_report"] = "无处方信息，无法审核。"
+            return extracted_data
+        # return parsed
+        # --- 步骤 2: 原子化查询拆解 (Requirement 2) ---
+        # 使用本地 LLM 将结构化数据拆解为多个具体的检索 Query
+        logger.info("正在进行原子化查询拆解...")
+        atomic_queries = self._decompose_case_to_atomic_queries(extracted_data)
+
+        # --- 步骤 3: RAG 辅助审核 ---
+        # 针对每个原子查询进行 RAG 检索和风险判断
+        logger.info(f"生成的原子查询列表: {atomic_queries}")
+        audit_results = self._execute_batch_audit(atomic_queries, extracted_data)
+
+        # --- 步骤 4: 结果注入 ---
+        extracted_data["audit_logic_trace"] = atomic_queries
+        extracted_data["audit_report"] = audit_results
+
+        logger.info("病历检阅完成。")
+        return extracted_data
 
     def ask(self, question: str) -> str:
         return self.rag_chain.invoke(question)
