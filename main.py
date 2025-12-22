@@ -107,20 +107,44 @@ def main():
     try:
         from rag_engine import MedicalRAG
         rag = MedicalRAG(data_path="data/")
-
-        mode = select_mode()
-
-        if mode == "1":
-            run_review_mode(rag)
-        else:
-            run_qa_mode(rag)
-
     except Exception as e:
         logging.critical(f"系统初始化失败: {e}", exc_info=True)
         logging.info("请检查：")
         logging.info("1. data/ 目录下是否有医学文档")
         logging.info("2. docs/ 目录是否存在（病历检阅模式）")
         logging.info("3. 依赖是否正确安装")
+        return
+
+    logging.info("系统初始化完成，进入主循环")
+
+    while True:
+        try:
+            print("\n请选择运行模式：")
+            print("1 - 病历检阅模式")
+            print("2 - 医学问答模式")
+            print("exit - 退出系统")
+
+            cmd = input("请输入指令: ").strip().lower()
+
+            if cmd in ("exit", "quit", "q"):
+                logging.info("收到退出指令，系统即将退出")
+                break
+
+            if cmd == "1":
+                run_review_mode(rag)
+            elif cmd == "2":
+                run_qa_mode(rag)
+            else:
+                print("无效指令，请重新输入")
+
+        except KeyboardInterrupt:
+            logging.info("检测到 Ctrl+C，中断当前操作，返回主菜单")
+            continue
+        except Exception as e:
+            logging.error(f"运行过程中发生异常: {e}", exc_info=True)
+            print("本次执行失败，已返回主菜单")
+
+    logging.info("医疗 RAG 系统已安全退出")
 
 
 if __name__ == "__main__":

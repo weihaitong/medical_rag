@@ -7,6 +7,7 @@ from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
+from langchain_core.documents import Document
 from langchain_qdrant import Qdrant
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import CrossEncoderReranker
@@ -404,7 +405,100 @@ class MedicalRAG:
             logger.error(f"Qdrant 写入失败，请检查 `./qdrant_db` 目录权限或磁盘空间。错误: {e}")
             raise
 
-    def _hybrid_retrieve(self, query: str) -> List:
+    def _graph_to_text(self, graph_record: dict) -> str:
+        """
+        【关键逻辑】将结构化图数据转换为自然语言文本
+        """
+        return (
+            f"【知识图谱确证】药物<{graph_record['head']}>与<{graph_record['tail']}>"
+            f"存在[{graph_record['relation']}]关系。\n"
+            f"详细机制：{graph_record.get('description', '无详细描述')}。\n"
+            f"数据来源：{graph_record.get('source', 'GraphDB')}"
+        )
+
+        # =========================================================================
+        #  核心逻辑重写区域：双路检索 + 统一重排 + 拆解修复
+        # =========================================================================
+
+    def _hybrid_retrieve(self, query: str) -> List[Document]:
+            """
+            【架构核心】执行双路检索与统一重排 (Hybrid Retrieval & Rerank)
+
+            逻辑流程：
+            1. Path A (快路): 图数据库/规则检索 -> 转化为高置信度文本 -> Document
+            2. Path B (慢路): 向量数据库检索 -> 获取上下文片段 -> Document
+            3. Merge: 合并两路结果
+            4. Rerank: 使用 Cross-Encoder 对所有结果进行语义相关性排序
+            """
+            logger.info(f"--- 开始双路检索: {query} ---")
+            all_candidates: List[Document] = []
+
+            # --- Path A: 快路 - 图引擎 (Rule/Graph Engine) ---
+            if self.graph_retriever:
+                try:
+                    # GraphRetriever 内部已封装 NER + Cypher 查询
+                    # 它返回的 Document 已经包含 "【知识图谱确证】" 这样的强语义前缀
+                    graph_docs = self.graph_retriever.retrieve(query)
+                    for doc in graph_docs:
+                        # 标记来源类型，Metadata 可用于后续过滤或 UI 展示
+                        doc.metadata["source_type"] = "KnowledgeGraph"
+                        # 图谱结果通常是硬规则，给予默认高分元数据（虽然 Cross-Encoder 会重新打分）
+                        doc.metadata["confidence"] = "high"
+
+                    all_candidates.extend(graph_docs)
+                    logger.info(f"Path A (Graph) 命中 {len(graph_docs)} 条结构化证据")
+                except Exception as e:
+                    logger.warning(f"图引擎检索异常: {e}")
+
+            # --- Path B: 慢路 - RAG引擎 (Vector DB) ---
+            if hasattr(self, 'vector_store'):
+                try:
+                    # 召回 Top-10，给 Reranker 足够的选择空间
+                    vector_docs = self.vector_store.similarity_search(query, k=10)
+                    for doc in vector_docs:
+                        doc.metadata["source_type"] = "VectorDB"
+                        doc.metadata["confidence"] = "medium"
+
+                    all_candidates.extend(vector_docs)
+                    logger.info(f"Path B (Vector) 召回 {len(vector_docs)} 条非结构化片段")
+                except Exception as e:
+                    logger.error(f"向量检索异常: {e}")
+
+            # --- Path C: 统一重排 (Unified Reranking) ---
+            if not all_candidates:
+                logger.warning("双路检索均无结果")
+                return []
+
+            # 1. 简单去重 (基于内容哈希)
+            unique_docs = {}
+            for doc in all_candidates:
+                # 移除空白字符后做Hash
+                doc_hash = hash(doc.page_content.replace(" ", "").strip())
+                if doc_hash not in unique_docs:
+                    unique_docs[doc_hash] = doc
+            candidates_list = list(unique_docs.values())
+
+            # 2. Cross-Encoder 重排
+            try:
+                logger.debug(f"合并后候选集 {len(candidates_list)} 条，开始 Rerank...")
+                compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
+                reranked_docs = compressor.compress_documents(
+                    documents=candidates_list,
+                    query=query
+                )
+
+                # 日志记录最终选中的 Top-3
+                for i, d in enumerate(reranked_docs):
+                    src = d.metadata.get('source_type', 'Unknown')
+                    logger.debug(f"Top-{i + 1} [{src}]: {d.page_content[:50]}...")
+
+                return reranked_docs
+
+            except Exception as e:
+                logger.error(f"Rerank 失败，降级为原始顺序: {e}")
+                return candidates_list[:3]
+
+    def _hybrid_retrieve2(self, query: str) -> List:
         """混合检索：向量 + 图 → 合并 → 统一 rerank"""
         # 1. 向量检索（原始相似性）
         logger.info(f"混合检索接收到查询： {query}")
@@ -794,70 +888,85 @@ class MedicalRAG:
 
     def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
         """
-        核心方法：使用本地模型进行查询重写与拆解。
-        将复杂的病例 JSON 上下文拆解为独立的、可检索的原子问题。
+        【已修复】将病例拆解为原子查询，增加空值安全处理 (Null Safety)
         """
-        # 1. 准备上下文
-        patient = case_json.get("patient_info", {}) or {}  # 防止 patient_info 本身是 None
+        # 1. 安全提取数据，防止 None 导致 crash
+        patient = case_json.get("patient_info", {}) or {}
         diagnosis_info = case_json.get("diagnosis_info", {}) or {}
         clinical_diagnosis = diagnosis_info.get("clinical_diagnosis", []) or []
-        # 修复：安全获取 meds，如果 treatment_plan 为 None 则默认为空列表
         treatment_plan = case_json.get("treatment_plan") or {}
         meds = treatment_plan.get("medications") or []
 
-        # 修复：更加健壮的处方字符串构建逻辑
-        # 1. 过滤掉 name 为 None 的无效数据
-        # 2. 确保 name 和 usage 都是字符串类型
+        # 2. 健壮的处方字符串构建
+        real_drug_names = []  # 用于Prompt提示
         valid_meds_str_list = []
         for m in meds:
-            # 使用 (var or '') 技巧：如果是 None 则变为空字符串
-            name = m.get('name')
-            usage = m.get('usage')
+            # 只有当 m 是字典且 key 存在时才处理
+            if isinstance(m, dict):
+                name = m.get('name')
+                usage = m.get('usage')
+                # 只有当药名存在(非None非空)时才拼接
+                if name:
+                    real_drug_names.append(name)
+                    med_str = f"{name} {usage or ''}".strip()
+                    valid_meds_str_list.append(med_str)
 
-            # 只有当药名存在时才拼接，否则跳过
-            if name:
-                med_str = f"{name} {usage or ''}".strip()
-                valid_meds_str_list.append(med_str)
-
-        # 如果列表为空（比如解析全是 None），给一个默认值，防止 LLM 理解歧义
         meds_context = ", ".join(valid_meds_str_list) if valid_meds_str_list else "无明确处方记录"
-
-        # 构造简化的 Prompt 上下文
+        drug_names_str = ", ".join(real_drug_names) if real_drug_names else "无"
+        # 3. 构造 Prompt 上下文
         context_str = (
             f"患者: {patient.get('age', '未知')}, {patient.get('gender', '未知')}\n"
             f"诊断: {', '.join(clinical_diagnosis)}\n"
             f"处方: {meds_context}"
         )
-
-        decomposition_prompt = f"""
-        你是一个临床药学审核系统的查询生成引擎。
-        请将以下病例拆解为多个独立的、用于检索医学知识库的【原子查询语句】。
-
+        # 定义专门的 System Prompt (覆盖默认的结构化专员设定)
+        system_instruction = (
+            "你是一个专业的【医学检索查询生成器】。\n"
+            "你的任务是生成搜索语句（String），而不是提取数据。\n"
+            "【严禁】输出 Key-Value 字典或对象。\n"
+            "【必须】输出纯字符串列表，例如：[\"查询语句1\", \"查询语句2\"]。"
+        )
+        # 定义 User Prompt (增强格式约束)
+        user_prompt = f"""
+                请将以下病例拆解为用于向量检索的【原子查询语句】。
+ 
         【病例信息】
         {context_str}
+        
+        【当前药物列表】
+        {meds_context}
 
-        【生成规则】
-        1. 针对每种药物，生成关于【用法用量】和【禁忌症】的查询。
-        2. 如果患者有特殊状态（老人、儿童、孕妇、肝肾功能不全），生成针对该状态的【特殊人群用药】查询。
-        3. 如果处方中有多种药物，生成两两之间的【相互作用】查询。
-        4. 生成针对诊断的【适应症】匹配查询。
+        【生成任务】(请严格执行，不要输出对象，只输出句子)
+        1. 用法用量：
+           - 生成：{drug_names_str}在{patient.get('age', '该年龄段')}中的用法用量
+        2. 禁忌症：
+           - 生成：{drug_names_str}的禁忌症
+        3. 适应症匹配：
+           - 对每个诊断生成：{drug_names_str}是否适用于[诊断]
+        4. 相互作用：
+           - (如果处方只有1种药，请忽略此项，不要生成null)
+        
+        【格式强制要求】
+        - 输出必须是 JSON 字符串列表 (List[str])。
+        - 列表中的元素必须是完整的自然语言句子。
+        - 正确格式：["乳果糖的用法用量", "乳果糖是否适用于便秘"]
 
-        【输出要求】
-        - 仅输出一个 JSON 列表格式的字符串。
-        - 列表元素为字符串（Query）。
-        - 不要输出任何其他解释。
-
-        【示例输出】
-        ["阿莫西林胶囊的成人标准用法用量", "阿莫西林与痛风的禁忌症", "阿莫西林是否适用于急性扁桃体炎"]
+        【请直接输出结果，不要包含Markdown标记】
         """
 
         try:
-            # 复用 self.ollama (7B模型) 以获得更好的指令遵循能力
-            # 如果想用更快的速度，可以切换为 self.rewrite_llm (0.5B)，但复杂拆解可能准确率较低
-            logger.info("模型生成原子查询 %s", decomposition_prompt)
-            response = self._invoke_llm(decomposition_prompt)
+            logger.debug("正在生成原子查询...")
+            # *** 关键修改：直接构造 messages，不经过 _invoke_llm ***
+            messages = [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_prompt}
+            ]
 
-            # 清洗结果，提取 JSON 列表
+            # 直接调用 ollama，绕过原有逻辑
+            response = self.ollama.generate(messages)
+
+            logger.info("self._invoke_llm  返回%s ", response)
+            # 清洗结果
             match = re.search(r"\[[\s\S]*\]", response)
             if match:
                 queries = json.loads(match.group(0))
@@ -865,10 +974,10 @@ class MedicalRAG:
             else:
                 logger.warning("查询拆解未能解析出 JSON 列表，使用后备规则。")
                 return self._fallback_decomposition(meds)
-
         except Exception as e:
             logger.error(f"查询拆解失败: {e}")
             return self._fallback_decomposition(meds)
+
 
     def _fallback_decomposition(self, meds: List[dict]) -> List[str]:
         """降级策略：基于规则的简单拆解"""
@@ -903,22 +1012,17 @@ class MedicalRAG:
         - 内部完成 retry / repair / fallback
         """
         logger.info("开始病历检阅（review_record）")
-
         prompt = self._build_review_prompt(medical_text)
-
         # 第一次尝试
         raw_output = self._safe_llm_call(prompt)
-
         # JSON 解析 + 自动修复
         extracted_data = self._parse_or_repair_json(raw_output, medical_text)
-
         logger.info("病历检阅完成（JSON 已结构化）%s", extracted_data)
         # 如果抽取失败或为空，直接返回
         if not extracted_data.get("treatment_plan", {}).get("medications"):
             logger.warning("未检测到处方信息，跳过用药审核步骤。")
             extracted_data["audit_report"] = "无处方信息，无法审核。"
             return extracted_data
-        # return parsed
         # --- 步骤 2: 原子化查询拆解 (Requirement 2) ---
         # 使用本地 LLM 将结构化数据拆解为多个具体的检索 Query
         logger.info("正在进行原子化查询拆解...")

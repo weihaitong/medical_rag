@@ -125,6 +125,24 @@ class GraphRetriever:
             logger.error(f"图数据库查询出错: {e}")
             return []
 
+    def query_relations(self, subject: str, object_: str = None) -> List[dict]:
+        """
+        模拟图数据库查询
+        返回结构化数据: [{'rel': '禁忌', 'tail': '痛风', 'desc': '可能导致尿酸升高'}]
+        """
+        # 实际代码这里应该是 Neo4j / NetworkX 的查询逻辑
+        # 这里做 Mock 数据演示逻辑
+        results = []
+        if "阿莫西林" in subject and "痛风" in (object_ or ""):
+            results.append({
+                "head": "阿莫西林",
+                "relation": "慎用/禁忌",
+                "tail": "痛风",
+                "description": "阿莫西林可能干扰尿酸排泄，痛风患者需调整剂量或监测。",
+                "source": "中国药典2020版-图谱库"
+            })
+        return results
+
     def __del__(self):
         if self.driver:
             self.driver.close()
