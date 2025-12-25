@@ -854,45 +854,44 @@ class MedicalRAG:
             "review_conclusion": "病历信息不足，无法完成结构化检阅。"
         }
 
-    def _execute_batch_audit(self, queries: List[str], case_context: dict) -> List[dict]:
+    def _execute_batch_audit(self, queries: List[str], case_context: dict) -> dict:
         """
-        执行批量审核：遍历原子查询 -> 混合检索 -> 验证逻辑
+        [修改版] 执行批量审核与整体总结
+        流程：遍历原子查询 -> 混合检索 -> 单点验证 -> 汇总生成整体报告
+        返回结构：
+        {
+            "details": [ ...单点审核结果... ],
+            "overall_analysis": {
+                "risk_level": "高/中/低",
+                "action": "通过/拦截/慎用",
+                "summary": "...",
+                "suggestions": "..."
+            }
+        }
         """
         results = []
 
+        # --- 阶段 1: 单点审核 (Map) ---
         for query in queries:
             try:
-                # 1. 复用混合检索 (Hybrid Retrieve)
-                # 注意：这里我们使用 RAG 类已有的 _hybrid_retrieve 方法
+                # 1. 复用混合检索
                 docs = self._hybrid_retrieve(query)
-
                 if not docs:
                     continue
 
-                # 2. 构造审核 Prompt
-                # 将检索到的证据 (Context) 和 原始病例 (Case) 结合
+                # 2. 构造单点审核 Prompt
                 context_text = "\n".join([d.page_content[:300] for d in docs])
                 sources = list(set([d.metadata.get("source", "未知") for d in docs]))
 
                 audit_prompt = f"""
-                你是一名药品安全审核员。请依据【检索到的医学证据】对【当前查询】进行风险评估。
-
-                【当前查询点】: {query}
-
-                【医学证据 (Evidence)】:
-                {context_text}
-
-                【审核任务】:
-                基于证据判断当前用药是否存在风险（如超量、配伍禁忌、证候不符）。
-
-                【输出格式】:
-                风险等级: (高/中/低/无)
-                审核结论: (简短描述，如“用法用量符合说明书”或“存在配伍禁忌风险”)
-                引用来源: {sources}
+                你是一名药品安全审核员。请依据证据对当前查询进行风险评估。
+                【当前查询】: {query}
+                【医学证据】: {context_text}
+                【任务】: 判断是否存在用药风险。
+                【输出要求】: 简练的一句话结论，指明风险等级(高/中/低/无)。
                 """
 
-                # 3. 调用 LLM 进行判断 (使用 rewrite_llm 这种小参数模型做快速判断即可，或者用 ollama)
-                # 这里为了准确性建议用 ollama generate
+                # 3. 调用 LLM (单点判断)
                 review_res = self.ollama.generate([
                     {"role": "system", "content": "你是一个严谨的药学审核助手。请简练回答。"},
                     {"role": "user", "content": audit_prompt}
@@ -907,7 +906,78 @@ class MedicalRAG:
             except Exception as e:
                 logger.error(f"审核查询 '{query}' 时发生错误: {e}")
 
-        return results
+        # --- 阶段 2: 整体总结 (Reduce) ---
+        if not results:
+            return {
+                "details": [],
+                "overall_analysis": "未触发任何审核规则，无风险数据。"
+            }
+
+        logger.info("单点审核完成，正在生成整体综述报告...")
+        try:
+            # 1. 准备汇总上下文
+            # 提取患者关键信息
+            patient_info = case_context.get("patient_info", {})
+            diagnosis_str = ", ".join(case_context.get("diagnosis_info", {}).get("clinical_diagnosis", []))
+
+            # 将所有单点审核结果拼接成文本
+            audit_trace = "\n".join([
+                f"- 检查点: {r['query']}\n  AI发现: {r['ai_review']}"
+                for r in results
+            ])
+
+            # 2. 构造“主审药师” Prompt
+            summary_prompt = f"""
+            你是一名三甲医院的【主任药师】。请根据下方的【患者信息】和【单项审核记录】，生成一份最终的用药安全综合评估报告。
+
+            【患者信息】
+            年龄: {patient_info.get('age', '未知')}, 性别: {patient_info.get('gender', '未知')}
+            诊断: {diagnosis_str}
+
+            【系统单项审核记录】
+            {audit_trace}
+
+            【你的任务】
+            1. 综合分析所有检查结果，判断是否存在冲突（例如：一个通过，另一个提示高风险）。
+            2. 给出最终的决策建议（通过 / 拦截 / 提示医生慎用）。
+            3. 如果有风险，请按照严重程度排序说明。
+
+            【输出格式 (JSON)】
+            请直接输出合法的 JSON，不要包含 Markdown 标记：
+            {{
+                "final_decision": "通过/拦截/人工复核",
+                "max_risk_level": "高/中/低/无",
+                "summary_text": "简短的综合评价（100字以内）",
+                "actionable_advice": "给医生的具体建议（如：建议停用XX药，改用XX）"
+            }}
+            """
+
+            # 3. 调用 LLM (综述)
+            final_verdict_raw = self.ollama.generate([
+                {"role": "system", "content": "你是由系统生成的最终决策层，必须输出 JSON 格式。"},
+                {"role": "user", "content": summary_prompt}
+            ])
+
+            # 4. 解析综述结果
+            import json, re
+            try:
+                # 尝试提取 JSON
+                match = re.search(r"\{[\s\S]*\}", final_verdict_raw)
+                if match:
+                    overall_analysis = json.loads(match.group(0))
+                else:
+                    overall_analysis = {"raw_text": final_verdict_raw}
+            except:
+                overall_analysis = {"raw_text": final_verdict_raw, "parse_error": "JSON解析失败"}
+
+        except Exception as e:
+            logger.error(f"生成整体总结时出错: {e}")
+            overall_analysis = {"error": str(e)}
+
+        return {
+            "details": results,
+            "overall_analysis": overall_analysis
+        }
 
     def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
         """
@@ -1054,11 +1124,18 @@ class MedicalRAG:
         # --- 步骤 3: RAG 辅助审核 ---
         # 针对每个原子查询进行 RAG 检索和风险判断
         logger.debug(f"生成的原子查询列表: {atomic_queries}")
-        audit_results = self._execute_batch_audit(atomic_queries, extracted_data)
+        # audit_results = self._execute_batch_audit(atomic_queries, extracted_data)
+        # 执行审核，现在返回的是包含 summary 的字典
+        full_audit_result = self._execute_batch_audit(atomic_queries, extracted_data)
 
         # --- 步骤 4: 结果注入 ---
-        extracted_data["audit_logic_trace"] = atomic_queries
-        extracted_data["audit_report"] = audit_results
+        # 将结果存入 extracted_data
+        # 建议把 details 和 summary 分开存，方便前端展示
+        extracted_data["audit_report_details"] = full_audit_result["details"]
+        extracted_data["audit_report_summary"] = full_audit_result["overall_analysis"]
+
+        # 为了兼容旧逻辑，可以保留 audit_report 字段
+        extracted_data["audit_report"] = full_audit_result
 
         logger.info("病历检阅完成。")
         return extracted_data
