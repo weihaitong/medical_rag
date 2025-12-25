@@ -1,4 +1,5 @@
 # rag_engine.py
+#启动方式：在终端中执行 streamlit run demo_app.py
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import logging
@@ -910,7 +911,12 @@ class MedicalRAG:
         if not results:
             return {
                 "details": [],
-                "overall_analysis": "未触发任何审核规则，无风险数据。"
+                "overall_analysis": {
+                    "final_decision": "无需审核",
+                    "max_risk_level": "无",
+                    "summary_text": "未生成有效查询或未触发审核规则，系统判断无风险。",
+                    "actionable_advice": "无"
+                }
             }
 
         logger.info("单点审核完成，正在生成整体综述报告...")
