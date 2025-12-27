@@ -469,82 +469,265 @@ class MedicalRAG:
             logger.error(f"LLM 修复后仍无法解析: {e}")
             return self._fallback_empty_review()
 
+    # def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
+    #     """[完全复原] 将病例拆解为原子查询"""
+    #     patient = case_json.get("patient_info", {}) or {}
+    #     diagnosis_info = case_json.get("diagnosis_info", {}) or {}
+    #     clinical_diagnosis = diagnosis_info.get("clinical_diagnosis", []) or []
+    #     treatment_plan = case_json.get("treatment_plan") or {}
+    #     meds = treatment_plan.get("medications") or []
+    #
+    #     real_drug_names = []
+    #     valid_meds_str_list = []
+    #     for m in meds:
+    #         if isinstance(m, dict):
+    #             name = m.get('name')
+    #             usage = m.get('usage')
+    #             if name:
+    #                 real_drug_names.append(name)
+    #                 med_str = f"{name} {usage or ''}".strip()
+    #                 valid_meds_str_list.append(med_str)
+    #
+    #     meds_context = ", ".join(valid_meds_str_list) if valid_meds_str_list else "无明确处方记录"
+    #     drug_names_str = ", ".join(real_drug_names) if real_drug_names else "无"
+    #
+    #     context_str = (
+    #         f"患者: {patient.get('age', '未知')}, {patient.get('gender', '未知')}\n"
+    #         f"诊断: {', '.join(clinical_diagnosis)}\n"
+    #         f"处方: {meds_context}"
+    #     )
+    #
+    #     system_instruction = (
+    #         "你是一个专业的【医学检索查询生成器】。\n"
+    #         "你的任务是生成搜索语句（String），而不是提取数据。\n"
+    #         "【严禁】输出 Key-Value 字典或对象。\n"
+    #         "【必须】输出纯字符串列表，例如：[\"查询语句1\", \"查询语句2\"]。"
+    #     )
+    #
+    #     user_prompt = f"""
+    #     请将以下病例拆解为用于向量检索的【原子查询语句】。
+    #
+    #     【病例信息】
+    #     {context_str}
+    #
+    #     【当前药物列表】
+    #     {meds_context}
+    #
+    #     【生成任务】(请严格执行，不要输出对象，只输出句子)
+    #     1. 用法用量：
+    #        - 生成：{drug_names_str}在{patient.get('age', '该年龄段')}中的用法用量
+    #     2. 禁忌症：
+    #        - 生成：{drug_names_str}的禁忌症
+    #     3. 适应症匹配：
+    #        - 对每个诊断生成：{drug_names_str}是否适用于[诊断]
+    #     4. 相互作用：
+    #        - (如果处方只有1种药，请忽略此项，不要生成null)
+    #
+    #     【格式强制要求】
+    #     - 输出必须是 JSON 字符串列表 (List[str])。
+    #     - 列表中的元素必须是完整的自然语言句子。
+    #     - 正确格式：["乳果糖的用法用量", "乳果糖是否适用于便秘"]
+    #
+    #     【请直接输出结果，不要包含Markdown标记】
+    #     """
+    #
+    #     try:
+    #         logger.debug("正在生成原子查询...")
+    #         messages = [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_prompt}]
+    #         # 直接调用 ollama，绕过 invoke_llm，和原代码一致
+    #         response = self.models.ollama.generate(messages)
+    #
+    #         match = re.search(r"\[[\s\S]*\]", response)
+    #         if match:
+    #             queries = json.loads(match.group(0))
+    #             return [str(q) for q in queries if isinstance(q, str)]
+    #         else:
+    #             return self._fallback_decomposition(meds)
+    #     except Exception as e:
+    #         logger.error(f"查询拆解失败: {e}")
+    #         return self._fallback_decomposition(meds)
+    # def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
+    #     """
+    #     [优化版] 将病例拆解为原子查询
+    #     策略：强制要求 LLM 对【每个药物】生成独立查询，禁止合并，提高检索命中率。
+    #     """
+    #     patient = case_json.get("patient_info", {}) or {}
+    #     diagnosis_info = case_json.get("diagnosis_info", {}) or {}
+    #     clinical_diagnosis = diagnosis_info.get("clinical_diagnosis", []) or []
+    #     treatment_plan = case_json.get("treatment_plan") or {}
+    #     meds = treatment_plan.get("medications") or []
+    #
+    #     # 提取药物名称列表
+    #     real_drug_names = []
+    #     for m in meds:
+    #         if isinstance(m, dict) and m.get('name'):
+    #             real_drug_names.append(m.get('name'))
+    #
+    #     # 如果没有药物，直接返回
+    #     if not real_drug_names:
+    #         return []
+    #
+    #     # 构造上下文
+    #     patient_str = f"{patient.get('age', '未知年龄')} {patient.get('gender', '未知性别')}"
+    #     diagnosis_str = ', '.join(clinical_diagnosis)
+    #     drugs_json_str = json.dumps(real_drug_names, ensure_ascii=False)  # ["布洛芬", "左氧氟沙星"]
+    #
+    #     system_instruction = (
+    #         "你是一个医学检索查询生成器。\n"
+    #         "你的任务是为列表中的【每一个药物】生成独立的检索语句。\n"
+    #         "【严禁】将多个药物合并在同一个查询中（如'A和B的禁忌'是错误的）。\n"
+    #         "【必须】输出纯字符串列表 List[str]。"
+    #     )
+    #
+    #     user_prompt = f"""
+    #     请根据以下信息生成原子化检索查询。
+    #
+    #     【患者信息】{patient_str}
+    #     【诊断信息】{diagnosis_str}
+    #     【药物列表】{drugs_json_str}
+    #
+    #     【生成规则】
+    #     请遍历【药物列表】，对**每一个药物**分别生成以下3个维度的查询语句：
+    #     1. 用法用量："[药物名] 说明书 用法用量 儿童/老人/孕妇" (根据患者特征调整)
+    #     2. 禁忌症："[药物名] 禁忌症"
+    #     3. 相互作用："[药物名] 与其他药物的相互作用" (如果只有1种药则跳过此项)
+    #     4. 适应症："[药物名] 是否适用于 [诊断]"
+    #
+    #     【示例】
+    #     输入药物: ["阿莫西林", "布洛芬"]，患者: 3岁
+    #     输出: [
+    #         "阿莫西林在3岁儿童中的用法用量",
+    #         "阿莫西林禁忌症",
+    #         "阿莫西林是否适用于感冒",
+    #         "布洛芬在3岁儿童中的用法用量",
+    #         "布洛芬禁忌症",
+    #         "布洛芬是否适用于感冒",
+    #         "阿莫西林与布洛芬的相互作用"
+    #     ]
+    #
+    #     【请直接输出 JSON 列表】
+    #     """
+    #
+    #     try:
+    #         logger.debug("正在生成原子查询 (One-by-One Strategy)...")
+    #         messages = [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_prompt}]
+    #         response = self.models.ollama.generate(messages)
+    #
+    #         match = re.search(r"\[[\s\S]*\]", response)
+    #         if match:
+    #             queries = json.loads(match.group(0))
+    #             # 再次清洗，确保都是字符串
+    #             return [str(q) for q in queries if isinstance(q, str)]
+    #         else:
+    #             return self._fallback_decomposition(meds)
+    #     except Exception as e:
+    #         logger.error(f"查询拆解失败: {e}")
+    #         return self._fallback_decomposition(meds)
+
     def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
-        """[完全复原] 将病例拆解为原子查询"""
+        """
+        [增强版] 将病例拆解为原子查询
+        增强了解析逻辑，防止因格式问题导致返回空列表。
+        """
+        import ast  # 确保引用
+
         patient = case_json.get("patient_info", {}) or {}
         diagnosis_info = case_json.get("diagnosis_info", {}) or {}
         clinical_diagnosis = diagnosis_info.get("clinical_diagnosis", []) or []
         treatment_plan = case_json.get("treatment_plan") or {}
         meds = treatment_plan.get("medications") or []
 
-        real_drug_names = []
-        valid_meds_str_list = []
+        # 提取药物名
+        drug_names = []
         for m in meds:
-            if isinstance(m, dict):
-                name = m.get('name')
-                usage = m.get('usage')
-                if name:
-                    real_drug_names.append(name)
-                    med_str = f"{name} {usage or ''}".strip()
-                    valid_meds_str_list.append(med_str)
+            if isinstance(m, dict) and m.get('name'):
+                drug_names.append(m.get('name'))
 
-        meds_context = ", ".join(valid_meds_str_list) if valid_meds_str_list else "无明确处方记录"
-        drug_names_str = ", ".join(real_drug_names) if real_drug_names else "无"
+        if not drug_names:
+            logger.warning("未提取到药物名称，跳过拆解。")
+            return []
 
+        # 构造 Context
         context_str = (
-            f"患者: {patient.get('age', '未知')}, {patient.get('gender', '未知')}\n"
+            f"患者: {patient.get('age', '未知')} {patient.get('gender', '未知')}\n"
             f"诊断: {', '.join(clinical_diagnosis)}\n"
-            f"处方: {meds_context}"
+            f"药物列表: {', '.join(drug_names)}"
         )
 
         system_instruction = (
-            "你是一个专业的【医学检索查询生成器】。\n"
-            "你的任务是生成搜索语句（String），而不是提取数据。\n"
-            "【严禁】输出 Key-Value 字典或对象。\n"
-            "【必须】输出纯字符串列表，例如：[\"查询语句1\", \"查询语句2\"]。"
+            "你是一个【医学检索查询生成器】。请为列表中的**每一个药物**分别生成检索查询。\n"
+            "必须输出纯 JSON 字符串列表 List[str]，不要包含任何解释性文字。"
         )
 
         user_prompt = f"""
-        请将以下病例拆解为用于向量检索的【原子查询语句】。
+        请将以下病例拆解为原子查询。
 
-        【病例信息】
+        【病例上下文】
         {context_str}
 
-        【当前药物列表】
-        {meds_context}
+        【生成要求】
+        请遍历药物列表 {drug_names}，对**每一个药物**都生成以下 3 条查询：
+        1. [药物名] 说明书 用法用量 [患者年龄]
+        2. [药物名] 禁忌症
+        3. [药物名] 是否适用于 [诊断]
 
-        【生成任务】(请严格执行，不要输出对象，只输出句子)
-        1. 用法用量：
-           - 生成：{drug_names_str}在{patient.get('age', '该年龄段')}中的用法用量
-        2. 禁忌症：
-           - 生成：{drug_names_str}的禁忌症
-        3. 适应症匹配：
-           - 对每个诊断生成：{drug_names_str}是否适用于[诊断]
-        4. 相互作用：
-           - (如果处方只有1种药，请忽略此项，不要生成null)
+        【示例】
+        输入: ["A药", "B药"]
+        输出: [
+            "A药 说明书 用法用量", "A药 禁忌症", "A药 是否适用于感冒",
+            "B药 说明书 用法用量", "B药 禁忌症", "B药 是否适用于感冒"
+        ]
 
-        【格式强制要求】
-        - 输出必须是 JSON 字符串列表 (List[str])。
-        - 列表中的元素必须是完整的自然语言句子。
-        - 正确格式：["乳果糖的用法用量", "乳果糖是否适用于便秘"]
-
-        【请直接输出结果，不要包含Markdown标记】
+        【请输出结果 (JSON List Only)】
         """
 
         try:
             logger.debug("正在生成原子查询...")
             messages = [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_prompt}]
-            # 直接调用 ollama，绕过 invoke_llm，和原代码一致
             response = self.models.ollama.generate(messages)
 
-            match = re.search(r"\[[\s\S]*\]", response)
-            if match:
-                queries = json.loads(match.group(0))
+            # --- 增强解析逻辑 ---
+
+            # 1. 尝试清洗 Markdown
+            cleaned_response = response.strip()
+            if cleaned_response.startswith("```"):
+                # 去除第一行和最后一行
+                lines = cleaned_response.split('\n')
+                if len(lines) >= 2:
+                    cleaned_response = "\n".join(lines[1:-1])
+            cleaned_response = cleaned_response.strip()
+
+            queries = []
+
+            # 2. 尝试 ast.literal_eval (最强解析，支持单引号)
+            try:
+                queries = ast.literal_eval(cleaned_response)
+            except:
+                pass
+
+            # 3. 如果失败，尝试正则提取 [...]
+            if not queries:
+                match = re.search(r"\[[\s\S]*\]", response)
+                if match:
+                    try:
+                        queries = json.loads(match.group(0))
+                    except:
+                        try:
+                            queries = ast.literal_eval(match.group(0))
+                        except:
+                            pass
+
+            # 4. 验证结果有效性
+            if queries and isinstance(queries, list) and len(queries) > 0:
+                logger.info(f"成功拆解出 {len(queries)} 条查询。")
                 return [str(q) for q in queries if isinstance(q, str)]
-            else:
-                return self._fallback_decomposition(meds)
+
+            # 5. 如果上面都失败了，走降级策略
+            logger.warning(f"原子查询解析失败，原始响应: {response[:100]}...，启用规则降级。")
+            return self._fallback_decomposition(meds)
+
         except Exception as e:
-            logger.error(f"查询拆解失败: {e}")
+            logger.error(f"查询拆解过程发生异常: {e}")
             return self._fallback_decomposition(meds)
 
     def _fallback_decomposition(self, meds: List[dict]) -> List[str]:
@@ -568,7 +751,14 @@ class MedicalRAG:
             try:
                 # 1. 复用混合检索
                 docs = self._hybrid_retrieve(query)
+                # 【关键修改】: 召回为空时的兜底逻辑
                 if not docs:
+                    logger.warning(f"查询 '{query}' 未召回任何文档，触发安全警告。")
+                    results.append({
+                        "query": query,
+                        "evidence_sources": ["❌ 知识库无相关数据"],
+                        "ai_review": "⚠️ **系统警告**：当前知识库中未找到该药物/症状的相关说明书或指南，无法进行智能评估。请药师务必**人工核查**此项。"
+                    })
                     continue
 
                 # 2. 构造单点审核 Prompt

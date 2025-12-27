@@ -51,16 +51,21 @@ class GraphRetriever:
         # 初始化 NER 模型（仅当 Neo4j 可用时加载）
         if self.driver and NER_AVAILABLE:
             try:
-                # 优先使用本地路径
-                local_path = "~/.cache/huggingface/hub"
+                # 【修改点 1】: 获取当前脚本所在的绝对路径，确保路径准确
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                # 假设 models 文件夹在项目根目录 (与 graph_retriever.py 同级或上一级)
+                # 如果 graph_retriever.py 在根目录：
+                target_model_path = os.path.join(current_dir, "models", "chinese-medical-ner")
 
-                # 检查本地目录是否存在
-                if os.path.exists(local_path):
-                    logger.info(f"正在加载本地 NER 模型: {local_path}")
-                    self.ner_model = NER(local_path)
+                # 【修改点 2】: 检查该路径是否存在
+                if os.path.exists(target_model_path):
+                    logger.info(f"✅ 正在加载本地 NER 模型: {target_model_path}")
+                    # 直接加载解压后的模型文件
+                    self.ner_model = NER(target_model_path)
                 else:
-                    # 只有本地不存在时，才尝试联网（虽然可能还是会慢）
-                    logger.warning("本地模型未找到，尝试联网加载 lixin12345/chinese-medical-ner")
+                    logger.warning(f"❌ 本地路径未找到: {target_model_path}")
+                    logger.warning("⚠️ 正在尝试联网加载 (这将导致启动非常慢)...")
+                    # 只有本地完全没有时，才使用 ID 加载
                     self.ner_model = NER("lixin12345/chinese-medical-ner")
             except Exception as e:
                 logger.error(f"医学 NER 模型初始化失败: {e}")
