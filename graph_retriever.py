@@ -51,7 +51,17 @@ class GraphRetriever:
         # 初始化 NER 模型（仅当 Neo4j 可用时加载）
         if self.driver and NER_AVAILABLE:
             try:
-                self.ner_model = NER("lixin12345/chinese-medical-ner")
+                # 优先使用本地路径
+                local_path = "~/.cache/huggingface/hub"
+
+                # 检查本地目录是否存在
+                if os.path.exists(local_path):
+                    logger.info(f"正在加载本地 NER 模型: {local_path}")
+                    self.ner_model = NER(local_path)
+                else:
+                    # 只有本地不存在时，才尝试联网（虽然可能还是会慢）
+                    logger.warning("本地模型未找到，尝试联网加载 lixin12345/chinese-medical-ner")
+                    self.ner_model = NER("lixin12345/chinese-medical-ner")
             except Exception as e:
                 logger.error(f"医学 NER 模型初始化失败: {e}")
                 self.ner_model = None

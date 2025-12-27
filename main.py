@@ -6,7 +6,8 @@ import logging
 import os
 from pathlib import Path
 from utils.json_logger import to_json_str
-
+# 强制使用国内镜像，防止漏网之鱼导致的连接超时
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 if os.path.exists("./qdrant_db/qdrant.lock"):
     os.remove("./qdrant_db/qdrant.lock")
 
