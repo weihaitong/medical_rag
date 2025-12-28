@@ -66,6 +66,8 @@ class UnifiedMedicalTextSplitter:
         final_chunks = []
 
         for doc in documents:
+            # 获取文件名作为强上下文（通常文件名就是药名，如 "左氧氟沙星片.txt"）
+            source_name = doc.metadata.get("source", "").replace(".txt", "").replace(".pdf", "")
             # 1. 预清洗
             raw_text = self._clean_text(doc.page_content)
 
@@ -113,13 +115,7 @@ class UnifiedMedicalTextSplitter:
                 # 格式：[二、NSCLC治疗] [（一）可切除类] 1. 手术评估 \n 具体内容...
                 # 这样即使切得很细，RAG 也能知道这是“NSCLC”的“手术评估”
 
-                context_prefix = ""
-                if current_context["l1"] and current_context["l1"] not in header:
-                    context_prefix += f"[{current_context['l1']}] "
-                if current_context["l2"] and current_context["l2"] not in header:
-                    context_prefix += f"[{current_context['l2']}] "
-
-                full_text = f"{context_prefix}{header}\n{content}"
+                full_text = f"药品：{source_name}\n章节：{clean_header}\n内容：{content}"
 
                 # 更新 Metadata
                 new_metadata = doc.metadata.copy()

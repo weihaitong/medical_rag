@@ -41,10 +41,11 @@ class MedicalRAG:
         self.graph_retriever = GraphRetriever() if GRAPH_RETRIEVER_AVAILABLE else None
         # 4. 构建业务链
         self._build_rag_chain()
-        # [新增] 动态配置参数 (默认值)
-        self.retrieval_k = 10
+        # 动态配置参数 (默认值)
+        self.retrieval_k = 20
         self.retrieval_threshold = 0.65
         self.enable_rerank = True
+        self.rerank_top_n = 10
 
     # =========================================================================
     #  业务功能 1: 混合检索 (完全复原)
@@ -98,6 +99,12 @@ class MedicalRAG:
             logger.debug(f"合并后候选集 {len(candidates_list)} 条，开始 Rerank...")
             compressor = CrossEncoderReranker(model=self.models.reranker, top_n=3)
             reranked_docs = compressor.compress_documents(documents=candidates_list, query=query)
+            # 调试日志：看看最终选了啥
+            for i, d in enumerate(reranked_docs):
+                src = d.metadata.get("source", "未知")
+                content_preview = d.page_content[:50].replace("\n", " ")
+                logger.debug(f"Top-{i+1} [{src}]: {content_preview}...")
+
             return reranked_docs
         except Exception as e:
             logger.error(f"Rerank 失败，降级为原始顺序: {e}")
@@ -659,6 +666,25 @@ class MedicalRAG:
             "必须输出纯 JSON 字符串列表 List[str]，不要包含任何解释性文字。"
         )
 
+        # 1. 提取患者特征并进行泛化
+        age_str = patient.get("age", "0")
+        age_keywords = [f"{age_str}岁"]
+
+        # 简单的规则泛化
+        try:
+            age_val = float(re.search(r"\d+", str(age_str)).group())
+            if age_val < 18:
+                age_keywords.extend(["儿童", "未成年人", "18岁以下", "少年"])
+            if age_val < 12:
+                age_keywords.append("小儿")
+            if age_val < 1:
+                age_keywords.append("婴幼儿")
+            if age_val > 60:
+                age_keywords.append("老年人")
+        except:
+            pass
+
+        age_query_suffix = " ".join(age_keywords)  # 结果如: "4岁 儿童 未成年人 18岁以下"
         user_prompt = f"""
         请将以下病例拆解为原子查询。
 
@@ -667,10 +693,10 @@ class MedicalRAG:
 
         【生成要求】
         请遍历药物列表 {drug_names}，对**每一个药物**都生成以下 3 条查询：
-        1. [药物名] 说明书 用法用量 [患者年龄]
-        2. [药物名] 禁忌症
+        1. [药物名] 说明书 用法用量 {age_query_suffix} (已注入年龄泛化词)
+        2. [药物名] 禁忌症 {age_query_suffix}
         3. [药物名] 是否适用于 [诊断]
-
+        
         【示例】
         输入: ["A药", "B药"]
         输出: [
@@ -687,7 +713,6 @@ class MedicalRAG:
             response = self.models.ollama.generate(messages)
 
             # --- 增强解析逻辑 ---
-
             # 1. 尝试清洗 Markdown
             cleaned_response = response.strip()
             if cleaned_response.startswith("```"):
@@ -740,42 +765,192 @@ class MedicalRAG:
                 queries.append(f"{name} 药物相互作用")
         return queries
 
+    # def _execute_batch_audit(self, queries: List[str], case_context: dict) -> dict:
+    #     """
+    #     [完全复原] 执行批量审核与整体总结 (Map-Reduce 逻辑)
+    #     """
+    #     results = []
+    #
+    #     # --- 阶段 1: 单点审核 (Map) ---
+    #     for query in queries:
+    #         try:
+    #             # 1. 复用混合检索
+    #             docs = self._hybrid_retrieve(query)
+    #             # 【关键修改】: 召回为空时的兜底逻辑
+    #             if not docs:
+    #                 logger.warning(f"查询 '{query}' 未召回任何文档，触发安全警告。")
+    #                 results.append({
+    #                     "query": query,
+    #                     "evidence_sources": ["❌ 知识库无相关数据"],
+    #                     "ai_review": "⚠️ **系统警告**：当前知识库中未找到该药物/症状的相关说明书或指南，无法进行智能评估。请药师务必**人工核查**此项。"
+    #                 })
+    #                 continue
+    #
+    #             # 2. 构造单点审核 Prompt
+    #             context_text = "\n".join([d.page_content[:300] for d in docs])
+    #             sources = list(set([d.metadata.get("source", "未知") for d in docs]))
+    #
+    #             audit_prompt = f"""
+    #             你是一名药品安全审核员。请依据证据对当前查询进行风险评估。
+    #             【当前查询】: {query}
+    #             【医学证据】: {context_text}
+    #             【任务】: 判断是否存在用药风险。
+    #             【输出要求】: 简练的一句话结论，指明风险等级(高/中/低/无)。
+    #             """
+    #
+    #             # 3. 调用 LLM
+    #             review_res = self.models.ollama.generate([
+    #                 {"role": "system", "content": "你是一个严谨的药学审核助手。请简练回答。"},
+    #                 {"role": "user", "content": audit_prompt}
+    #             ])
+    #
+    #             results.append({
+    #                 "query": query,
+    #                 "evidence_sources": sources,
+    #                 "ai_review": review_res
+    #             })
+    #
+    #         except Exception as e:
+    #             logger.error(f"审核查询 '{query}' 时发生错误: {e}")
+    #
+    #     # --- 阶段 2: 整体总结 (Reduce) ---
+    #     if not results:
+    #         return {
+    #             "details": [],
+    #             "overall_analysis": {
+    #                 "final_decision": "无需审核",
+    #                 "max_risk_level": "无",
+    #                 "summary_text": "未生成有效查询或未触发审核规则，系统判断无风险。",
+    #                 "actionable_advice": "无"
+    #             }
+    #         }
+    #
+    #     logger.info("单点审核完成，正在生成整体综述报告...")
+    #     try:
+    #         # 1. 准备汇总上下文
+    #         patient_info = case_context.get("patient_info", {})
+    #         diagnosis_str = ", ".join(case_context.get("diagnosis_info", {}).get("clinical_diagnosis", []))
+    #
+    #         audit_trace = "\n".join([
+    #             f"- 检查点: {r['query']}\n  AI发现: {r['ai_review']}"
+    #             for r in results
+    #         ])
+    #
+    #         # 2. 构造“主审药师” Prompt
+    #         summary_prompt = f"""
+    #         你是一名三甲医院的【主任药师】。请根据下方的【患者信息】和【单项审核记录】，生成一份最终的用药安全综合评估报告。
+    #
+    #         【患者信息】
+    #         年龄: {patient_info.get('age', '未知')}, 性别: {patient_info.get('gender', '未知')}
+    #         诊断: {diagnosis_str}
+    #
+    #         【系统单项审核记录】
+    #         {audit_trace}
+    #
+    #         【你的任务】
+    #         1. 综合分析所有检查结果，判断是否存在冲突（例如：一个通过，另一个提示高风险）。
+    #         2. 给出最终的决策建议（通过 / 拦截 / 提示医生慎用）。
+    #         3. 如果有风险，请按照严重程度排序说明。
+    #
+    #         【输出格式 (JSON)】
+    #         请直接输出合法的 JSON，不要包含 Markdown 标记：
+    #         {{
+    #             "final_decision": "通过/拦截/人工复核",
+    #             "max_risk_level": "高/中/低/无",
+    #             "summary_text": "简短的综合评价（100字以内）",
+    #             "actionable_advice": "给医生的具体建议（如：建议停用XX药，改用XX）"
+    #         }}
+    #         """
+    #
+    #         # 3. 调用 LLM
+    #         final_verdict_raw = self.models.ollama.generate([
+    #             {"role": "system", "content": "你是由系统生成的最终决策层，必须输出 JSON 格式。"},
+    #             {"role": "user", "content": summary_prompt}
+    #         ])
+    #
+    #         # 4. 解析
+    #         import json, re
+    #         try:
+    #             match = re.search(r"\{[\s\S]*\}", final_verdict_raw)
+    #             if match:
+    #                 overall_analysis = json.loads(match.group(0))
+    #             else:
+    #                 overall_analysis = {"raw_text": final_verdict_raw}
+    #         except:
+    #             overall_analysis = {"raw_text": final_verdict_raw, "parse_error": "JSON解析失败"}
+    #
+    #     except Exception as e:
+    #         logger.error(f"生成整体总结时出错: {e}")
+    #         overall_analysis = {"error": str(e)}
+    #
+    #     return {
+    #         "details": results,
+    #         "overall_analysis": overall_analysis
+    #     }
+
     def _execute_batch_audit(self, queries: List[str], case_context: dict) -> dict:
         """
-        [完全复原] 执行批量审核与整体总结 (Map-Reduce 逻辑)
+        [防幻觉优化版] 执行批量审核
+        核心改进：防止 LLM 张冠李戴（把 A 药的禁忌安在 B 药头上）。
         """
         results = []
 
-        # --- 阶段 1: 单点审核 (Map) ---
+        # 提取患者信息
+        patient_info = case_context.get("patient_info", {})
+        age_str = patient_info.get("age", "未知")
+        gender = patient_info.get("gender", "未知")
+
         for query in queries:
             try:
-                # 1. 复用混合检索
+                # 1. 检索
                 docs = self._hybrid_retrieve(query)
-                # 【关键修改】: 召回为空时的兜底逻辑
+
                 if not docs:
-                    logger.warning(f"查询 '{query}' 未召回任何文档，触发安全警告。")
                     results.append({
                         "query": query,
-                        "evidence_sources": ["❌ 知识库无相关数据"],
-                        "ai_review": "⚠️ **系统警告**：当前知识库中未找到该药物/症状的相关说明书或指南，无法进行智能评估。请药师务必**人工核查**此项。"
+                        "evidence_sources": ["❌ 知识库缺失"],
+                        "ai_review": "⚠️ **资料缺失**：未检索到说明书，无法判断。"
                     })
                     continue
 
-                # 2. 构造单点审核 Prompt
-                context_text = "\n".join([d.page_content[:300] for d in docs])
+                # 2. 构造带来源的上下文 (Key Change!)
+                # 格式：[来源: 药品A说明书.txt] ...内容...
+                context_parts = []
+                for i, d in enumerate(docs):
+                    src = d.metadata.get("source", "未知来源")
+                    content = d.page_content[:400].replace("\n", " ")  # 压缩换行
+                    context_parts.append(f"片段{i + 1} (来源: {src}): {content}")
+
+                context_text = "\n\n".join(context_parts)
                 sources = list(set([d.metadata.get("source", "未知") for d in docs]))
 
+                # 从 Query 中提取当前正在查的药物名（简单提取）
+                target_drug = query.split(" ")[0]  # 假设 Query 格式为 "药物名 ..."
+
+                # 3. 构造防幻觉 Prompt
                 audit_prompt = f"""
-                你是一名药品安全审核员。请依据证据对当前查询进行风险评估。
-                【当前查询】: {query}
-                【医学证据】: {context_text}
-                【任务】: 判断是否存在用药风险。
-                【输出要求】: 简练的一句话结论，指明风险等级(高/中/低/无)。
+                你是一名临床药师。请审核【{target_drug}】在患者（{age_str}, {gender}）身上的用药风险。
+
+                【医学证据片段】
+                {context_text}
+
+                【审查步骤】
+                1. **来源核对（关键）**：请检查每个片段的“来源”或内容中的“药品名称”。
+                   - 如果片段是关于【{target_drug}】的，请采信。
+                   - 如果片段是关于其他药物（如左氧氟沙星、阿司匹林等）的，**请直接忽略，严禁引用**。
+                2. **提取限制**：仅从核对无误的片段中，寻找关于“年龄”、“禁忌”的描述。
+                3. **判定风险**：
+                   - 高风险：证据明确说“禁用”。
+                   - 中风险：证据说“慎用”或“未进行实验”。
+                   - 低风险：用法明确且适用。
+
+                【输出要求】
+                简练回答，格式：“风险等级：X。理由：...”。引用证据时请注明片段来源。
                 """
 
-                # 3. 调用 LLM
+                # 4. 调用 LLM
                 review_res = self.models.ollama.generate([
-                    {"role": "system", "content": "你是一个严谨的药学审核助手。请简练回答。"},
+                    {"role": "system", "content": "你是一个严谨的药师。注意区分不同药物的说明书，不要张冠李戴。"},
                     {"role": "user", "content": audit_prompt}
                 ])
 
@@ -787,76 +962,43 @@ class MedicalRAG:
 
             except Exception as e:
                 logger.error(f"审核查询 '{query}' 时发生错误: {e}")
+                results.append({"query": query, "ai_review": f"Error: {e}", "evidence_sources": []})
 
-        # --- 阶段 2: 整体总结 (Reduce) ---
+        # --- 阶段 3: 总结 (保持不变) ---
         if not results:
-            return {
-                "details": [],
-                "overall_analysis": {
-                    "final_decision": "无需审核",
-                    "max_risk_level": "无",
-                    "summary_text": "未生成有效查询或未触发审核规则，系统判断无风险。",
-                    "actionable_advice": "无"
-                }
-            }
+            return {"details": [], "overall_analysis": {"final_decision": "通过", "summary_text": "无"}}
 
-        logger.info("单点审核完成，正在生成整体综述报告...")
         try:
-            # 1. 准备汇总上下文
-            patient_info = case_context.get("patient_info", {})
-            diagnosis_str = ", ".join(case_context.get("diagnosis_info", {}).get("clinical_diagnosis", []))
-
-            audit_trace = "\n".join([
-                f"- 检查点: {r['query']}\n  AI发现: {r['ai_review']}"
-                for r in results
-            ])
-
-            # 2. 构造“主审药师” Prompt
+            audit_trace = "\n".join([f"- {r['query']} -> {r['ai_review']}" for r in results])
             summary_prompt = f"""
-            你是一名三甲医院的【主任药师】。请根据下方的【患者信息】和【单项审核记录】，生成一份最终的用药安全综合评估报告。
-
-            【患者信息】
-            年龄: {patient_info.get('age', '未知')}, 性别: {patient_info.get('gender', '未知')}
-            诊断: {diagnosis_str}
-
-            【系统单项审核记录】
+            汇总药师审核结果，给出最终处方建议。
+            【患者】{age_str} {gender}
+            【审核记录】
             {audit_trace}
 
-            【你的任务】
-            1. 综合分析所有检查结果，判断是否存在冲突（例如：一个通过，另一个提示高风险）。
-            2. 给出最终的决策建议（通过 / 拦截 / 提示医生慎用）。
-            3. 如果有风险，请按照严重程度排序说明。
+            【决策】高风险/禁用 -> 拦截；中风险 -> 人工复核；低风险 -> 通过。
 
-            【输出格式 (JSON)】
-            请直接输出合法的 JSON，不要包含 Markdown 标记：
-            {{
-                "final_decision": "通过/拦截/人工复核",
-                "max_risk_level": "高/中/低/无",
-                "summary_text": "简短的综合评价（100字以内）",
-                "actionable_advice": "给医生的具体建议（如：建议停用XX药，改用XX）"
-            }}
+            【输出 JSON】
+            {{ "final_decision": "...", "max_risk_level": "...", "summary_text": "...", "actionable_advice": "..." }}
             """
 
-            # 3. 调用 LLM
             final_verdict_raw = self.models.ollama.generate([
-                {"role": "system", "content": "你是由系统生成的最终决策层，必须输出 JSON 格式。"},
+                {"role": "system", "content": "输出纯 JSON。"},
                 {"role": "user", "content": summary_prompt}
             ])
 
-            # 4. 解析
-            import json, re
-            try:
-                match = re.search(r"\{[\s\S]*\}", final_verdict_raw)
-                if match:
+            import json, re, ast
+            match = re.search(r"\{[\s\S]*\}", final_verdict_raw)
+            if match:
+                try:
                     overall_analysis = json.loads(match.group(0))
-                else:
-                    overall_analysis = {"raw_text": final_verdict_raw}
-            except:
-                overall_analysis = {"raw_text": final_verdict_raw, "parse_error": "JSON解析失败"}
+                except:
+                    overall_analysis = ast.literal_eval(match.group(0))
+            else:
+                overall_analysis = {"final_decision": "人工复核", "summary_text": final_verdict_raw}
 
         except Exception as e:
-            logger.error(f"生成整体总结时出错: {e}")
-            overall_analysis = {"error": str(e)}
+            overall_analysis = {"final_decision": "系统错误", "summary_text": str(e)}
 
         return {
             "details": results,
@@ -900,10 +1042,11 @@ class MedicalRAG:
         return extracted_data
 
 # [新增] 暴露给前端的动态配置接口
-    def update_config(self, k: int, threshold: float):
+    def update_config(self, k: int, threshold: float, kn: int,):
         self.retrieval_k = k
         self.retrieval_threshold = threshold
-        logger.info(f"配置已更新: K={k}, Threshold={threshold}")
+        self.rerank_top_n = kn
+        logger.info(f"配置已更新: K={k}, Threshold={threshold}, rerank_top_n = ={kn}")
 
     # [新增] 暴露给前端的知识库新增接口
     def add_knowledge(self, text: str, filename: str):

@@ -42,7 +42,7 @@ with st.sidebar:
     st.title("控制台")
 
     # ------------------------------------------------
-    # 模块 A: 病历场景选择 (恢复的功能)
+    # 模块 A: 病历场景选择
     # ------------------------------------------------
     st.markdown("### 📂 场景选择")
 
@@ -68,7 +68,7 @@ with st.sidebar:
         index=0
     )
 
-    # 确定默认文本 (逻辑：如果选了特定病历，就填入内容；否则留空或保持状态)
+    # 确定默认文本
     default_text = ""
     case_desc = "手动输入或粘贴文本"
 
@@ -84,7 +84,7 @@ with st.sidebar:
     st.divider()
 
     # ------------------------------------------------
-    # 模块 B: 参数调优
+    # 模块 B: 参数调优 (新增 Top-N)
     # ------------------------------------------------
     st.markdown("### 🎛️ 模型参数调优")
     with st.container():
@@ -92,24 +92,36 @@ with st.sidebar:
         new_threshold = st.slider(
             "相似度阈值 (Threshold)",
             min_value=0.0, max_value=1.0,
-            value=engine.retrieval_threshold,  # 读取当前内存中的值
+            value=engine.retrieval_threshold,
             step=0.05,
-            help="低于此分数的文档将被初筛过滤。调低可增加召回，调高更精准。"
+            help="向量检索初筛阈值。调低可增加召回（防止漏掉表格），调高更精准。"
         )
 
         # 2. 召回数量滑块
         new_k = st.slider(
-            "召回数量 (Top-K)",
-            min_value=1, max_value=30,
+            "初筛数量 (Retrieval K)",
+            min_value=5, max_value=50,
             value=engine.retrieval_k,
+            step=5,
+            help="向量数据库初步召回的文档数量（建议设大一点，如30）。"
+        )
+
+        # 3. 重排数量滑块 (新增)
+        new_rerank_n = st.slider(
+            "重排数量 (Rerank Top-N)",
+            min_value=1, max_value=15,
+            value=getattr(engine, 'rerank_top_n', 5),  # 默认取值，防止属性不存在报错
             step=1,
-            help="向量检索阶段初筛的文档数量。"
+            help="经 Reranker 精选后，最终喂给 LLM 的片段数量（建议 5-10）。"
         )
 
         # 实时应用配置到引擎实例
-        if new_threshold != engine.retrieval_threshold or new_k != engine.retrieval_k:
-            engine.update_config(k=new_k, threshold=new_threshold)
-            st.toast(f"参数已更新: K={new_k}, Thr={new_threshold}", icon="✅")
+        if (new_threshold != engine.retrieval_threshold or
+                new_k != engine.retrieval_k or
+                new_rerank_n != engine.rerank_top_n):
+            # 调用更新方法
+            engine.update_config(k=new_k, threshold=new_threshold, kn=new_rerank_n)
+            st.toast(f"参数更新: K={new_k}, Thr={new_threshold}, TopN={new_rerank_n}", icon="✅")
 
     st.divider()
 
@@ -149,16 +161,15 @@ with st.sidebar:
 
 st.markdown('<div class="main-header">🏥 智能处方审核系统</div>', unsafe_allow_html=True)
 
-# 显示当前生效的参数状态条
-st.info(f"⚙️ 当前引擎配置：召回阈值 **{engine.retrieval_threshold}** | 召回数量 **{engine.retrieval_k}**")
+# 显示当前生效的参数状态条 (更新显示 Top-N)
+st.info(
+    f"⚙️ 当前引擎配置：召回阈值 **{engine.retrieval_threshold}** | 初筛数量 **{engine.retrieval_k}** | 重排数量 **{engine.rerank_top_n}**")
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
     st.subheader("📋 病历输入")
 
-    # 这里的 value 会根据 sidebar 的选择动态变化
-    # 注意：如果用户手动修改了文本，再切换下拉框，这里会被下拉框的内容覆盖
     medical_input = st.text_area(
         "病历文本 (支持编辑)",
         value=default_text,
@@ -181,9 +192,9 @@ if audit_btn:
                 # 1. 结构化
                 status_box.write("1. 正在结构化病历与意图识别...")
 
-                # 2. 检索
+                # 2. 检索 (更新显示 Top-N)
                 status_box.write(
-                    f"2. 正在执行多路检索 (Threshold={engine.retrieval_threshold}, K={engine.retrieval_k})...")
+                    f"2. 正在执行多路检索 (Thr={engine.retrieval_threshold}, K={engine.retrieval_k}, TopN={engine.rerank_top_n})...")
 
                 # 3. 审核
                 status_box.write("3. 正在生成决策...")
