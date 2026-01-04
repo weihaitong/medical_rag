@@ -14,7 +14,7 @@ st.set_page_config(
 
 # 使用 Streamlit 的缓存机制，确保日志只配置一次，不会因为页面刷新而重复添加
 @st.cache_resource
-def setup_logging(log_file="medical_rag.log"):
+def setup_logging(log_file="logs/medical_rag.log"):
     # 1. 获取根记录器
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
