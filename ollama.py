@@ -33,15 +33,20 @@ class OllamaClient:
             self.base_url,
         )
 
-    def generate(self, messages: List[Dict[str, str]], options: Optional[Dict[str, Any]] = None) -> str:
+    # 【修改点 1】增加了 model 参数，默认为 None
+    def generate(self, messages: List[Dict[str, str]], options: Optional[Dict[str, Any]] = None, model: Optional[str] = None) -> str:
         """
         同步调用 Ollama /api/chat
         messages: [{"role": "system|user|assistant", "content": "文本内容"}]
+        model: (可选) 动态覆盖默认模型
         """
         url = f"{self.base_url}/api/chat"
 
+        # 【修改点 2】优先使用传入的 model，否则用 self.model
+        target_model = model if model else self.model
+
         payload = {
-            "model": self.model,
+            "model": target_model,
             "messages": messages,
             "stream": False,
             "options": self._merge_options(options),

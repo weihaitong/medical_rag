@@ -71,6 +71,11 @@ class MedicalRAG:
         self.enable_rerank = True
         self.rerank_top_n = 10
 
+       # 快模型：用于结构化提取、查询拆解 (速度快，逻辑要求低)
+        self.fast_model = "qwen3:1.7b"
+        # 慢模型：用于最终审核、风险决策 (逻辑强，速度慢)
+        self.smart_model = "qwen2:7b-instruct-q5_K_M"
+
     # =========================================================================
     #  【修正 3】将这些方法移出 __init__，作为类的方法
     # =========================================================================
@@ -394,13 +399,13 @@ class MedicalRAG:
             },
             {"role": "user", "content": prompt}
         ]
-        return self.models.ollama.generate(messages)
+        return self.models.ollama.generate(messages, model=self.fast_model)
 
     def _safe_llm_call(self, prompt: str, retry: int = 2) -> str:
         last_error = None
         for attempt in range(1, retry + 1):
             try:
-                return self._invoke_llm(prompt)
+                return self._invoke_llm(prompt)# _invoke_llm 内部默认使用了 self.fast_model
             except Exception as e:
                 last_error = e
                 logger.warning(f"LLM 调用失败 # {attempt}: {e}")
@@ -592,7 +597,7 @@ class MedicalRAG:
         try:
             logger.debug("正在生成原子查询...")
             messages = [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_prompt}]
-            response = self.models.ollama.generate(messages)
+            response = self.models.ollama.generate(messages, model=self.fast_model)
 
             # --- 增强解析逻辑 ---
             # 1. 尝试清洗 Markdown
@@ -649,12 +654,16 @@ class MedicalRAG:
 
     def _execute_batch_audit(self, queries: List[str], case_context: dict) -> dict:
         """
-        [防幻觉优化版] 执行批量审核
-        核心改进：防止 LLM 张冠李戴（把 A 药的禁忌安在 B 药头上）。
+        [防幻觉优化版 - 并行加速] 执行批量审核
+        核心改进：
+        1. 防止 LLM 张冠李戴。
+        2. 使用线程池并行执行检索和审核，大幅降低总耗时。
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         results = []
 
-        # 提取患者信息
+        # 1. 提取公共上下文信息 (避免在线程中重复提取)
         patient_info = case_context.get("patient_info", {})
         age_str = patient_info.get("age", "未知")
         gender = patient_info.get("gender", "未知")
@@ -662,21 +671,20 @@ class MedicalRAG:
         diagnosis_list = diagnosis_info.get("clinical_diagnosis", [])
         diagnosis_str = ", ".join(diagnosis_list) if diagnosis_list else "未明确诊断"
 
-        for query in queries:
+        # 2. 定义单个查询的处理逻辑 (Worker Function)
+        def _process_single_query(query: str):
             try:
-                # 1. 检索
+                # 2.1 检索
                 docs = self._hybrid_retrieve(query)
 
                 if not docs:
-                    results.append({
+                    return {
                         "query": query,
                         "evidence_sources": ["❌ 知识库缺失"],
                         "ai_review": "⚠️ **资料缺失**：未检索到说明书，无法判断。"
-                    })
-                    continue
+                    }
 
-                # 2. 构造带来源的上下文 (Key Change!)
-                # 格式：[来源: 药品A说明书.txt] ...内容...
+                # 2.2 构造带来源的上下文
                 context_parts = []
                 for i, d in enumerate(docs):
                     src = d.metadata.get("source", "未知来源")
@@ -686,10 +694,10 @@ class MedicalRAG:
                 context_text = "\n\n".join(context_parts)
                 sources = list(set([d.metadata.get("source", "未知") for d in docs]))
 
-                # 从 Query 中提取当前正在查的药物名（简单提取）
-                target_drug = query.split(" ")[0]  # 假设 Query 格式为 "药物名 ..."
+                # 从 Query 中提取当前正在查的药物名
+                target_drug = query.split(" ")[0]
 
-                # 3. 构造防幻觉 Prompt
+                # 2.3 构造防幻觉 Prompt (内容保持不变)
                 audit_prompt = f"""
                 你是一名临床药师。请审核【{target_drug}】在患者（{age_str}, {gender}）身上的用药风险。
 
@@ -714,23 +722,41 @@ class MedicalRAG:
                 简练回答，格式：“风险等级：X。理由：...”。引用证据时请注明片段来源。
                 """
 
-                # 4. 调用 LLM
+                # 2.4 调用 LLM
                 review_res = self.models.ollama.generate([
                     {"role": "system", "content": "你是一个严谨的药师。注意区分不同药物的说明书，不要张冠李戴。"},
                     {"role": "user", "content": audit_prompt}
-                ])
+                ],
+                    model=self.smart_model
+                )
 
-                results.append({
+                return {
                     "query": query,
                     "evidence_sources": sources,
                     "ai_review": review_res
-                })
+                }
 
             except Exception as e:
                 logger.error(f"审核查询 '{query}' 时发生错误: {e}")
-                results.append({"query": query, "ai_review": f"Error: {e}", "evidence_sources": []})
+                return {"query": query, "ai_review": f"Error: {e}", "evidence_sources": []}
 
-        # --- 阶段 3: 总结 (保持不变) ---
+        # 3. 并发执行 (Map)
+        # max_workers=3 是一个保守值，适合大多数本地部署场景。
+        # 如果是高性能服务器，可以调大到 5-10。
+        logger.info(f"开始并发审核 {len(queries)} 个查询...")
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            # 提交所有任务
+            future_to_query = {executor.submit(_process_single_query, q): q for q in queries}
+
+            # 获取结果
+            for future in as_completed(future_to_query):
+                try:
+                    res = future.result()
+                    results.append(res)
+                except Exception as exc:
+                    logger.error(f"并发任务执行异常: {exc}")
+
+        # 4. 整体总结 (Reduce) - 保持不变
         if not results:
             return {"details": [], "overall_analysis": {"final_decision": "通过", "summary_text": "无"}}
 
@@ -741,8 +767,8 @@ class MedicalRAG:
             患者基本信息】
             - 年龄：{age_str}
             - 性别：{gender}
-            - 临床诊断：{diagnosis_str}  <-- 【新增】加上这一行
-            
+            - 临床诊断：{diagnosis_str}
+
             【审核记录】
             {audit_trace}
 
@@ -755,7 +781,9 @@ class MedicalRAG:
             final_verdict_raw = self.models.ollama.generate([
                 {"role": "system", "content": "输出纯 JSON。"},
                 {"role": "user", "content": summary_prompt}
-            ])
+            ],
+                model=self.smart_model
+            )
 
             import json, re, ast
             match = re.search(r"\{[\s\S]*\}", final_verdict_raw)
@@ -774,7 +802,6 @@ class MedicalRAG:
             "details": results,
             "overall_analysis": overall_analysis
         }
-
     def review_record(self, medical_text: str) -> dict:
         """病历检阅主入口 (Extraction -> Decomposition -> Batch Audit)"""
         logger.info("开始病历检阅（review_record）")

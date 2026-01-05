@@ -145,7 +145,11 @@ class ModelFactory:
                 "device": "mps",  # Mac使用 mps，服务器使用 cuda
                 "model_kwargs": {
                     "trust_remote_code": True,
-                    "torch_dtype": torch.float16
+                    # --- 修复开始 ---
+                    # 必须通过 automodel_args 传递底层模型参数
+                    "automodel_args": {
+                        "torch_dtype": torch.float16
+                    }
                 }
             }
             self.reranker = HuggingFaceCrossEncoder(
