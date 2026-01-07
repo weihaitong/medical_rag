@@ -520,18 +520,29 @@ class MedicalRAG:
 
     def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
         """
-        [增强版] 将病例拆解为原子查询
-        增强了解析逻辑，防止因格式问题导致返回空列表。
-        """
-        import ast  # 确保引用
+        [全面优化版] 将病例拆解为原子查询
 
+        优化策略：
+        1. **维度扩展**：增加药物相互作用、特殊人群、重复用药等审核维度。
+        2. **效率提升**：
+           - 单药查询合并：将适应症、禁忌、用法合并为一条"说明书综合查询"。
+           - 交互查询合并：将所有药物组合生成一条"相互作用查询"。
+        3. **鲁棒性**：增强 JSON 解析能力。
+        """
+        import ast
+        import json
+        import re
+
+        # 1. 数据提取与预处理
         patient = case_json.get("patient_info", {}) or {}
         diagnosis_info = case_json.get("diagnosis_info", {}) or {}
         clinical_diagnosis = diagnosis_info.get("clinical_diagnosis", []) or []
+        diagnosis_str = ", ".join(clinical_diagnosis) if clinical_diagnosis else "未明确诊断"
+
         treatment_plan = case_json.get("treatment_plan") or {}
         meds = treatment_plan.get("medications") or []
 
-        # 提取药物名
+        # 提取药物名列表
         drug_names = []
         for m in meds:
             if isinstance(m, dict) and m.get('name'):
@@ -541,69 +552,82 @@ class MedicalRAG:
             logger.warning("未提取到药物名称，跳过拆解。")
             return []
 
-        # 构造 Context
-        context_str = (
-            f"患者: {patient.get('age', '未知')} {patient.get('gender', '未知')}\n"
-            f"诊断: {', '.join(clinical_diagnosis)}\n"
-            f"药物列表: {', '.join(drug_names)}"
-        )
-
-        system_instruction = (
-            "你是一个【医学检索查询生成器】。请为列表中的**每一个药物**分别生成检索查询。\n"
-            "必须输出纯 JSON 字符串列表 List[str]，不要包含任何解释性文字。"
-        )
-
-        # 1. 提取患者特征并进行泛化
+        # 2. 患者特征泛化 (用于增强检索相关性)
         age_str = patient.get("age", "0")
-        age_keywords = [f"{age_str}岁"]
+        gender_str = patient.get("gender", "")
 
-        # 简单的规则泛化
+        # 构造特征关键词：如 "4岁 儿童", "65岁 老年人", "孕妇"
+        patient_tags = [f"{age_str}"]
         try:
+            # 简单的规则提取
             age_val = float(re.search(r"\d+", str(age_str)).group())
             if age_val < 18:
-                age_keywords.extend(["儿童", "未成年人", "18岁以下", "少年"])
-            if age_val < 12:
-                age_keywords.append("小儿")
+                patient_tags.extend(["儿童", "未成年人", "小儿"])
             if age_val < 1:
-                age_keywords.append("婴幼儿")
-            if age_val > 60:
-                age_keywords.append("老年人")
+                patient_tags.append("婴幼儿")
+            if age_val >= 60:
+                patient_tags.append("老年人")
         except:
             pass
 
-        age_query_suffix = " ".join(age_keywords)  # 结果如: "4岁 儿童 未成年人 18岁以下"
+        if "孕" in str(case_json): patient_tags.append("孕妇")
+        if "哺" in str(case_json): patient_tags.append("哺乳期")
+
+        patient_feature_str = " ".join(patient_tags)
+
+        # 3. 构造 Prompt
+        # 策略：
+        # - 对每个药：生成一条包含【说明书、用法、禁忌、适应症、特殊人群】的综合查询
+        # - 对整体：生成一条【药物相互作用、配伍禁忌】的查询 (如果药>1)
+
+        drugs_json_str = json.dumps(drug_names, ensure_ascii=False)
+
+        system_instruction = (
+            "你是一个【医学检索查询生成器】。\n"
+            "请根据患者情况和药物列表，生成用于 RAG 检索的查询语句列表。\n"
+            "必须输出纯 JSON 字符串列表 List[str]，严禁包含 Markdown 标记或解释文字。"
+        )
+
         user_prompt = f"""
-        请将以下病例拆解为原子查询。
+        【输入上下文】
+        患者特征: {patient_feature_str} {gender_str}
+        临床诊断: {diagnosis_str}
+        药物列表: {drugs_json_str}
 
-        【病例上下文】
-        {context_str}
+        【生成任务】
+        请生成两类查询语句：
 
-        【生成要求】
-        请遍历药物列表 {drug_names}，对**每一个药物**都生成以下 3 条查询：
-        1. [药物名] 说明书 用法用量 {age_query_suffix} (已注入年龄泛化词)
-        2. [药物名] 禁忌症 {age_query_suffix}
-        3. [药物名] 是否适用于 [诊断]
+        1. **单药综合查询**：请遍历药物列表，对**每一个药物**生成 1 条查询，涵盖该药的说明书核心要素。
+           - 格式："[药物名] 说明书 适应症 禁忌症 用法用量 注意事项 {patient_feature_str} 是否适用于 {diagnosis_str}"
+
+        2. **联合用药查询**：如果药物列表中有 2 个或以上药物，请生成 1 条查询用于检查相互作用。
+           - 格式："{' '.join(drug_names)} 药物相互作用 配伍禁忌 重复用药风险"
+           - (如果只有 1 个药，则不生成此条)
 
         【示例】
-        输入: ["A药", "B药"]
+        输入: 药物=["A药", "B药"], 患者="65岁 老年", 诊断="高血压"
         输出: [
-            "A药 说明书 用法用量", "A药 禁忌症", "A药 是否适用于感冒",
-            "B药 说明书 用法用量", "B药 禁忌症", "B药 是否适用于感冒"
+            "A药 说明书 适应症 禁忌症 用法用量 注意事项 65岁 老年 是否适用于 高血压",
+            "B药 说明书 适应症 禁忌症 用法用量 注意事项 65岁 老年 是否适用于 高血压",
+            "A药 B药 药物相互作用 配伍禁忌"
         ]
 
         【请输出结果 (JSON List Only)】
         """
 
         try:
-            logger.debug("正在生成原子查询...")
-            messages = [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_prompt}]
-            response = self.models.ollama.generate(messages, model=self.fast_model)
+            logger.debug(f"正在生成原子查询 (使用 {self.fast_model})...")
+            # 使用 fast_model (1.5B) 即可，这主要是格式化任务
+            response = self.models.ollama.generate(
+                [{"role": "system", "content": system_instruction},
+                 {"role": "user", "content": user_prompt}],
+                model=self.fast_model
+            )
 
-            # --- 增强解析逻辑 ---
-            # 1. 尝试清洗 Markdown
+            # --- 4. 增强解析逻辑 (Copied from previous robust implementation) ---
             cleaned_response = response.strip()
+            # 去除 Markdown ```json ... ```
             if cleaned_response.startswith("```"):
-                # 去除第一行和最后一行
                 lines = cleaned_response.split('\n')
                 if len(lines) >= 2:
                     cleaned_response = "\n".join(lines[1:-1])
@@ -611,13 +635,13 @@ class MedicalRAG:
 
             queries = []
 
-            # 2. 尝试 ast.literal_eval (最强解析，支持单引号)
+            # 策略 A: ast.literal_eval (处理单引号)
             try:
                 queries = ast.literal_eval(cleaned_response)
             except:
                 pass
 
-            # 3. 如果失败，尝试正则提取 [...]
+            # 策略 B: json.loads + 正则提取
             if not queries:
                 match = re.search(r"\[[\s\S]*\]", response)
                 if match:
@@ -629,27 +653,41 @@ class MedicalRAG:
                         except:
                             pass
 
-            # 4. 验证结果有效性
+            # 验证与返回
             if queries and isinstance(queries, list) and len(queries) > 0:
-                logger.info(f"成功拆解出 {len(queries)} 条查询。")
-                return [str(q) for q in queries if isinstance(q, str)]
+                final_queries = [str(q) for q in queries if isinstance(q, str)]
+                logger.info(f"成功拆解出 {len(final_queries)} 条查询。")
+                return final_queries
 
-            # 5. 如果上面都失败了，走降级策略
+            # 失败兜底
             logger.warning(f"原子查询解析失败，原始响应: {response[:100]}...，启用规则降级。")
-            return self._fallback_decomposition(meds)
+            return self._fallback_decomposition(meds, patient_feature_str)
 
         except Exception as e:
             logger.error(f"查询拆解过程发生异常: {e}")
-            return self._fallback_decomposition(meds)
+            return self._fallback_decomposition(meds, patient_feature_str)
 
-    def _fallback_decomposition(self, meds: List[dict]) -> List[str]:
+    def _fallback_decomposition(self, meds: List[dict], patient_str: str = "") -> List[str]:
+        """
+        [规则降级] 当 LLM 生成失败时，使用固定模板生成查询
+        """
         queries = []
+        drug_names = []
+
+        # 1. 单药查询
         for m in meds:
             name = m.get('name')
             if name:
-                queries.append(f"{name} 说明书 用法用量")
-                queries.append(f"{name} 禁忌症")
-                queries.append(f"{name} 药物相互作用")
+                drug_names.append(name)
+                # 生成一条大而全的查询，利用 BGE-M3 的长文本检索能力
+                q = f"{name} 说明书 适应症 禁忌症 用法用量 注意事项 {patient_str}"
+                queries.append(q)
+
+        # 2. 相互作用查询 (如果有多药)
+        if len(drug_names) > 1:
+            all_drugs = " ".join(drug_names)
+            queries.append(f"{all_drugs} 药物相互作用 配伍禁忌")
+
         return queries
 
     def _execute_batch_audit(self, queries: List[str], case_context: dict) -> dict:
