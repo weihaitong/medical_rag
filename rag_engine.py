@@ -614,7 +614,6 @@ class MedicalRAG:
 
         【请输出结果 (JSON List Only)】
         """
-
         try:
             logger.debug(f"正在生成原子查询 (使用 {self.fast_model})...")
             # 使用 fast_model (1.5B) 即可，这主要是格式化任务
