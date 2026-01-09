@@ -142,13 +142,13 @@ class ModelFactory:
             target_model = reranker_path if os.path.exists(reranker_path) else "BAAI/bge-reranker-v2-m3"
             self.reranker_args = {
                 "model_name": target_model,
-                "device": "mps",  # Mac使用 mps，服务器使用 cuda
+                "device": "cpu",  # 强制使用cpu解决mac在这个模型的bug
                 "model_kwargs": {
                     "trust_remote_code": True,
                     # --- 修复开始 ---
                     # 必须通过 automodel_args 传递底层模型参数
                     "automodel_args": {
-                        "torch_dtype": torch.float16
+                        "torch_dtype": torch.float32
                     }
                 }
             }
