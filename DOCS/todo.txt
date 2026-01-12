@@ -49,7 +49,13 @@ todo：
 ---------
 faiss - cosine 相似度
 稀疏检索 密集检索。融合检索 BM25分
-召回率 MRR nDCG
+召回率 MRR nDCG，Recall、MRR 和 nDCG 是用来评估 检索器（Retriever） 性能的三大核心指标。
+1. 召回率 (Recall) —— “有没有找到？”
+2.MRR (Mean Reciprocal Rank, 平均倒数排名) —— “答案是不是在最前面？”决定了 RAG 系统回答问题的响应效率和准确性（不仅要找到，还要放在第一位）
+3.nDCG (normalized Discounted Cumulative Gain, 归一化折损累计增益) —— “整体排序是不是最合理的？”越相关的文档，应该排得越靠前。
+先保 Recall（先得找到答案，否则一切免谈）。
+再看 MRR（尽量把答案往前提，方便 LLM 理解）。
+最后看 nDCG（精细化调优，处理复杂多文档场景）。
 
 开启稀疏矩阵***
 -------
