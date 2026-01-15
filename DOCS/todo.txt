@@ -64,3 +64,5 @@ faiss - cosine 相似度
 3、每条子查询中的信息多是否合适？
 4、deepseek engram是否可以应用到RAG
 
+
+5、今天很是不高兴
