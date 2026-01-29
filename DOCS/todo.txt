@@ -65,3 +65,4 @@ faiss - cosine 相似度
 4、deepseek engram是否可以应用到RAG
 
 ----接下来做什么呢
+着重AI：EHPC和监控
