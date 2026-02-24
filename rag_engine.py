@@ -877,7 +877,7 @@ class MedicalRAG:
         logger.info("开始病历检阅（review_record）")
 
         # 1. 结构化抽取
-        prompt = self._build_review_prompt(medical_text)
+        prompt = self._build_review_prompt(medical_text)#结构化抽取完全没有必要，在生产环节会自动上游接入
         logger.debug("病历结构化抽取（JSON 已结构化）")
 
         raw_output = self._safe_llm_call(prompt)
