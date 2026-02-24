@@ -880,7 +880,7 @@ class MedicalRAG:
         prompt = self._build_review_prompt(medical_text)#结构化抽取完全没有必要，在生产环节会自动上游接入
         logger.debug("病历结构化抽取（JSON 已结构化）")
 
-        raw_output = self._safe_llm_call(prompt)
+        raw_output = self._safe_llm_call(prompt)#调用ollama client 传入对应的模型
         logger.debug("病历结构化、json化完成")
 
         extracted_data = self._parse_or_repair_json(raw_output, medical_text)
