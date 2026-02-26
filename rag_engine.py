@@ -883,12 +883,12 @@ class MedicalRAG:
         raw_output = self._safe_llm_call(prompt)#调用ollama client 传入对应的模型
         logger.debug("病历结构化、json化完成")
 
-        extracted_data = self._parse_or_repair_json(raw_output, medical_text)
+        extracted_data = self._parse_or_repair_json(raw_output, medical_text)#解析json，生产环境从下面开始
 
         logger.info("病历检阅完成（JSON 已结构化）%s", extracted_data)
 
         # 1. 尝试从标准位置获取
-        meds = extracted_data.get("treatment_plan", {}).get("medications")
+        meds = extracted_data.get("treatment_plan", {}).get("medications")#todo his系统中的病历格式
 
         # 2. 如果没找到，尝试从根目录获取（兼容小模型）
         if not meds:
@@ -910,6 +910,7 @@ class MedicalRAG:
         logger.debug(f"生成的原子查询列表: {atomic_queries}")
 
         # 3. 批量审核 (RAG 辅助)
+        #多进程审核
         full_audit_result = self._execute_batch_audit(atomic_queries, extracted_data)
 
         # 4. 结果注入
