@@ -213,3 +213,7 @@ def main():
 if __name__ == "__main__":
     setup_logging()
     main()
+
+# 482  ollama run Qwen/Qwen3-1.7B
+#   483  ollama run Qwen3:1.7B
+#   484  ollama run qwen2:7b-instruct-q5_K_M
